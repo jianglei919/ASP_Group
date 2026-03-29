@@ -1,4 +1,4 @@
 # Main branch ignore rules
 include/
 src/
-Makefile
+out/

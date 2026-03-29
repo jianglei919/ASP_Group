@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 
+/* 客户端默认连接主服务端 */
 #define PRIMARY_HOST "127.0.0.1"
 #define PRIMARY_PORT 5000
 #define MAX_COMMAND_LEN 512
@@ -9,7 +10,7 @@ static int connect_to_server(const char *host, int port)
 {
     (void)host;
     (void)port;
-    /* TODO: create socket and connect() to target server. */
+    /* TODO: 创建套接字并 connect() 到目标服务端 */
     return -1;
 }
 
@@ -26,7 +27,7 @@ static int validate_command(const char *line, char *err, size_t err_size)
         return -1;
     }
 
-    /* TODO: enforce command grammar for dirlist/fn/fz/ft/fdb/fda/quitc. */
+    /* TODO: 按作业要求校验 dirlist/fn/fz/ft/fdb/fda/quitc 语法 */
     err[0] = '\0';
     return 0;
 }
@@ -35,14 +36,14 @@ static int send_command(int server_fd, const char *line)
 {
     (void)server_fd;
     (void)line;
-    /* TODO: send encoded request frame. */
+    /* TODO: 按协议编码并发送请求帧 */
     return 0;
 }
 
 static int receive_response(int server_fd)
 {
     (void)server_fd;
-    /* TODO: print text response or save temp.tar.gz to ~/project. */
+    /* TODO: 接收响应，文本打印或将 temp.tar.gz 保存到 ~/project */
     return 0;
 }
 
@@ -59,6 +60,7 @@ int main(void)
         return 1;
     }
 
+    /* 交互式命令循环：读入、校验、发送、接收 */
     while (fgets(line, sizeof(line), stdin) != NULL)
     {
         line[strcspn(line, "\n")] = '\0';

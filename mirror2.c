@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 
+/* 镜像服务端2基础配置（骨架版） */
 #define NODE_NAME "mirror2"
 #define DEFAULT_PORT 5002
 #define BACKLOG 16
@@ -17,7 +18,7 @@ typedef struct server_config
 static int create_listen_socket(const server_config_t *cfg)
 {
     (void)cfg;
-    /* TODO: socket() + bind() + listen() */
+    /* TODO: 使用 socket() / bind() / listen() 创建监听套接字 */
     return -1;
 }
 
@@ -26,7 +27,7 @@ static int read_command_line(int client_fd, char *buf, size_t size)
     (void)client_fd;
     (void)buf;
     (void)size;
-    /* TODO: read one command from client */
+    /* TODO: 从客户端连接读取一条完整命令 */
     return -1;
 }
 
@@ -34,12 +35,13 @@ static int process_command(int client_fd, const char *cmd)
 {
     (void)client_fd;
     (void)cmd;
-    /* TODO: implement dirlist/fn/fz/ft/fdb/fda handling */
+    /* TODO: 实现 dirlist/fn/fz/ft/fdb/fda 命令处理 */
     return 0;
 }
 
 static void crequest(int client_fd)
 {
+    /* 每个客户端连接由一个子进程独占处理 */
     char cmd[MAX_COMMAND_LEN];
 
     for (;;)
@@ -65,6 +67,7 @@ static void crequest(int client_fd)
 static int run_server(const server_config_t *cfg)
 {
     int listen_fd = create_listen_socket(cfg);
+    /* 仅为骨架阶段避免未使用函数告警 */
     (void)crequest;
     if (listen_fd < 0)
     {
@@ -74,10 +77,10 @@ static int run_server(const server_config_t *cfg)
 
     /*
      * TODO:
-     * 1) accept loop
-     * 2) fork per connection
-     * 3) child calls crequest(client_fd)
-     * 4) parent continues listening
+     * 1) 实现 accept 循环
+     * 2) 每个连接 fork 一个子进程
+     * 3) 子进程调用 crequest(client_fd)
+     * 4) 父进程继续监听新连接
      */
 
     close(listen_fd);
@@ -87,6 +90,7 @@ static int run_server(const server_config_t *cfg)
 int main(void)
 {
     server_config_t cfg;
+    /* 骨架默认监听所有网卡 */
     cfg.bind_host = "0.0.0.0";
     cfg.bind_port = DEFAULT_PORT;
 
