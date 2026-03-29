@@ -11,23 +11,23 @@
 当前代码为作业提交版骨架，核心业务逻辑保留了 TODO 标注，便于后续逐步实现。
 
 ## 2. 项目结构图
-```mermaid
-graph TD
-    A[ASP_Group] --> B[w26server.c]
-    A --> C[mirror1.c]
-    A --> D[mirror2.c]
-    A --> E[client.c]
-    A --> F[Makefile]
-    A --> G[.gitignore]
-    A --> H[doc]
-    H --> H1[Project_W26.pdf]
-    H --> H2[Requirement_Summary.md]
-    H --> H3[Requirement_Summary_zh.md]
-    A --> I[out]
-    I --> I1[w26server]
-    I --> I2[mirror1]
-    I --> I3[mirror2]
-    I --> I4[client]
+```text
+ASP_Group/
+├── w26server.c
+├── mirror1.c
+├── mirror2.c
+├── client.c
+├── Makefile
+├── .gitignore
+├── doc/
+│   ├── Project_W26.pdf
+│   ├── Requirement_Summary.md
+│   └── Requirement_Summary_zh.md
+└── out/
+    ├── w26server
+    ├── mirror1
+    ├── mirror2
+    └── client
 ```
 
 ## 3. 架构图
@@ -47,6 +47,30 @@ flowchart LR
     FS3 -->|文本结果 或 temp.tar.gz| CL
 
     CL -->|保存压缩包到 ~/project| P[客户端 project 目录]
+
+    classDef user fill:#FFE08A,stroke:#B7791F,stroke-width:2px,color:#2D1B00;
+    classDef client fill:#9AE6B4,stroke:#2F855A,stroke-width:2px,color:#0F2E1D;
+    classDef server fill:#90CDF4,stroke:#2B6CB0,stroke-width:2px,color:#102A43;
+    classDef fs fill:#FBD38D,stroke:#B7791F,stroke-width:2px,color:#4A2C00;
+    classDef storage fill:#E9D8FD,stroke:#6B46C1,stroke-width:2px,color:#2D1B69;
+
+    class U user;
+    class CL client;
+    class S1,S2,S3 server;
+    class FS1,FS2,FS3 fs;
+    class P storage;
+
+    linkStyle 0 stroke:#2F855A,stroke-width:2px;
+    linkStyle 1 stroke:#2B6CB0,stroke-width:2px;
+    linkStyle 2 stroke:#2B6CB0,stroke-width:2px;
+    linkStyle 3 stroke:#2B6CB0,stroke-width:2px;
+    linkStyle 4 stroke:#B7791F,stroke-width:2px;
+    linkStyle 5 stroke:#B7791F,stroke-width:2px;
+    linkStyle 6 stroke:#B7791F,stroke-width:2px;
+    linkStyle 7 stroke:#805AD5,stroke-width:2px;
+    linkStyle 8 stroke:#805AD5,stroke-width:2px;
+    linkStyle 9 stroke:#805AD5,stroke-width:2px;
+    linkStyle 10 stroke:#6B46C1,stroke-width:2px,stroke-dasharray: 4 2;
 ```
 
 ## 4. 编译脚本
