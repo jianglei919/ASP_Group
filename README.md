@@ -13,10 +13,11 @@
 ## 2. 项目结构图
 ```text
 ASP_Group/
-├── w26server.c
-├── mirror1.c
-├── mirror2.c
-├── client.c
+├── src/
+│   ├── w26server.c
+│   ├── mirror1.c
+│   ├── mirror2.c
+│   └── client.c
 ├── Makefile
 ├── .gitignore
 ├── doc/

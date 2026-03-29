@@ -2,10 +2,10 @@ CC = gcc
 CFLAGS = -std=c11 -Wall -Wextra -pedantic
 OUT_DIR = out
 
-SERVER_SRC = w26server.c
-MIRROR1_SRC = mirror1.c
-MIRROR2_SRC = mirror2.c
-CLIENT_SRC = client.c
+SERVER_SRC = src/w26server.c
+MIRROR1_SRC = src/mirror1.c
+MIRROR2_SRC = src/mirror2.c
+CLIENT_SRC = src/client.c
 
 SERVER_BIN = $(OUT_DIR)/w26server
 MIRROR1_BIN = $(OUT_DIR)/mirror1
