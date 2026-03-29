@@ -1,4 +1,8 @@
-# Main branch ignore rules
-include/
-src/
-Makefile
+# Dev branch ignore rules
+# include/, src/, and Makefile are intentionally NOT ignored in this branch.
+*.o
+w26server
+mirror1
+mirror2
+client
+temp.tar.gz
