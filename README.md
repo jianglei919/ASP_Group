@@ -18,12 +18,22 @@ ASP_Group/
 │   ├── mirror1.c
 │   ├── mirror2.c
 │   └── client.c
+├── scripts/
+│   ├── run_w26server.sh
+│   ├── run_mirror1.sh
+│   ├── run_mirror2.sh
+│   ├── run_client.sh
+│   ├── start_all_servers.sh
+│   ├── stop_all_servers.sh
+│   └── server_status.sh
 ├── Makefile
 ├── .gitignore
 ├── doc/
 │   ├── Project_W26.pdf
 │   ├── Requirement_Summary.md
 │   └── Requirement_Summary_zh.md
+├── logs/                # 运行时生成（服务端日志）
+├── .pids/               # 运行时生成（服务端进程号）
 └── out/
     ├── w26server
     ├── mirror1
@@ -81,7 +91,7 @@ flowchart LR
 #!/usr/bin/env bash
 set -e
 
-cd "$(dirname "$0")"
+cd "$(cd "$(dirname "$0")" && pwd)"
 make clean
 make
 ```
@@ -93,49 +103,66 @@ make clean && make
 ```
 
 ## 5. 运行脚本
-建议使用 4 个终端分别运行 3 个服务端和 1 个客户端。
+已提供两种运行方式：逐个启动和一键启动。
 
-### 5.1 启动服务端
-终端 1：
-
-```bash
-#!/usr/bin/env bash
-set -e
-
-cd "$(dirname "$0")"
-./out/w26server
-```
-
-终端 2：
+### 5.1 方式一：逐个启动（4 个终端）
+终端 1（主服务端）：
 
 ```bash
-#!/usr/bin/env bash
-set -e
-
-cd "$(dirname "$0")"
-./out/mirror1
+./scripts/run_w26server.sh
 ```
 
-终端 3：
+终端 2（镜像服务端 1）：
 
 ```bash
-#!/usr/bin/env bash
-set -e
-
-cd "$(dirname "$0")"
-./out/mirror2
+./scripts/run_mirror1.sh
 ```
 
-### 5.2 启动客户端
-终端 4：
+终端 3（镜像服务端 2）：
 
 ```bash
-#!/usr/bin/env bash
-set -e
-
-cd "$(dirname "$0")"
-./out/client
+./scripts/run_mirror2.sh
 ```
+
+终端 4（客户端）：
+
+```bash
+./scripts/run_client.sh
+```
+
+### 5.2 方式二：一键管理服务端
+一键后台启动 3 个服务端（自动创建 logs 和 .pids）：
+
+```bash
+./scripts/start_all_servers.sh
+```
+
+查看服务端状态：
+
+```bash
+./scripts/server_status.sh
+```
+
+停止全部服务端：
+
+```bash
+./scripts/stop_all_servers.sh
+```
+
+启动完成后，再单独启动客户端：
+
+```bash
+./scripts/run_client.sh
+```
+
+### 5.3 脚本列表说明
+- `scripts/run_w26server.sh`：前台启动主服务端。
+- `scripts/run_mirror1.sh`：前台启动镜像服务端 1。
+- `scripts/run_mirror2.sh`：前台启动镜像服务端 2。
+- `scripts/run_client.sh`：前台启动客户端。
+- `scripts/start_all_servers.sh`：后台一键启动 3 个服务端，并记录 PID 与日志。
+- `scripts/server_status.sh`：检查 3 个服务端的 PID 与运行状态。
+- `scripts/stop_all_servers.sh`：根据 PID 文件停止全部服务端。
 
 ## 6. 常用测试命令示例
 客户端启动后可输入：
@@ -154,4 +181,6 @@ quitc
 ## 7. 说明
 - out 目录用于存放编译产物。
 - .gitignore 已配置忽略 out 目录。
+- logs 目录由 `start_all_servers.sh` 自动生成，用于保存服务端日志。
+- .pids 目录由 `start_all_servers.sh` 自动生成，用于保存服务端 PID 文件。
 - 当前为骨架代码，未实现部分均以 TODO 标注。

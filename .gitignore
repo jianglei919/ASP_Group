@@ -1,3 +1,5 @@
 # Main branch ignore rules
 include/
 out/
+logs/
+.pids/
