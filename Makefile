@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -std=c11 -Wall -Wextra -pedantic
+CFLAGS = -std=c11 -Wall -Wextra -pedantic -pthread
 OUT_DIR = out
 
 SERVER_SRC = src/w26server.c

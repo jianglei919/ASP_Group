@@ -184,3 +184,26 @@ quitc
 - logs 目录由 `start_all_servers.sh` 自动生成，用于保存服务端日志。
 - .pids 目录由 `start_all_servers.sh` 自动生成，用于保存服务端 PID 文件。
 - 当前为骨架代码，未实现部分均以 TODO 标注。
+
+## 8. 状态发现协议
+当前实现采用“镜像主动心跳 + 主服务端在线表 + 客户端按可用性选路”。
+
+### 8.1 协议命令
+- `HEARTBEAT mirror1`：由 mirror1 周期上报给 w26server。
+- `HEARTBEAT mirror2`：由 mirror2 周期上报给 w26server。
+- `GET_NODES`：客户端向 w26server 请求在线表。
+- `PING`：基础连通性检测命令。
+
+### 8.2 在线判定规则
+- w26server 维护镜像最近心跳时间（状态文件：`/tmp/w26_nodes_status.txt`）。
+- 当 `当前时间 - 最近心跳时间 <= TTL` 时，节点视为在线。
+- 当前 TTL 为 6 秒，镜像心跳周期为 2 秒。
+
+### 8.3 客户端选路策略
+- 连接序号优先级：
+    - 1-2 -> w26server
+    - 3-4 -> mirror1
+    - 5-6 -> mirror2
+    - 7+ 按 `w26server -> mirror1 -> mirror2` 循环
+- 在优先节点不可用时，客户端按顺序跳过到下一个在线节点。
+- 客户端对 `GET_NODES` 结果做短缓存（TTL 2 秒），降低每条命令都查询在线表的开销。

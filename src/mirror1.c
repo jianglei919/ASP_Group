@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -12,6 +13,9 @@
 /* 镜像服务端1基础配置 */
 #define NODE_NAME "mirror1"
 #define DEFAULT_PORT 5001
+#define PRIMARY_HOST "127.0.0.1"
+#define PRIMARY_PORT 5000
+#define HEARTBEAT_INTERVAL_SEC 2
 #define BACKLOG 16
 #define MAX_COMMAND_LEN 512
 
@@ -49,6 +53,121 @@ static int send_all(int fd, const char *data, size_t len)
     }
 
     return 0;
+}
+
+/*
+ * 功能：按行接收文本响应。
+ * 实现原理：逐字节读取直到换行，用于心跳应答消费。
+ */
+static int recv_line(int fd, char *buf, size_t size)
+{
+    size_t idx = 0;
+
+    if (buf == NULL || size == 0)
+    {
+        return -1;
+    }
+
+    while (idx + 1 < size)
+    {
+        char ch;
+        ssize_t n = recv(fd, &ch, 1, 0);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0)
+        {
+            break;
+        }
+        if (ch == '\n')
+        {
+            break;
+        }
+        if (ch != '\r')
+        {
+            buf[idx++] = ch;
+        }
+    }
+
+    buf[idx] = '\0';
+    return (idx > 0) ? 0 : -1;
+}
+
+/*
+ * 功能：向主服务端发送一次心跳。
+ * 实现原理：短连接发送 HEARTBEAT mirror1，并读取一行应答。
+ */
+static int send_heartbeat_once(void)
+{
+    int fd;
+    struct sockaddr_in addr;
+    char line[64];
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+    {
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)PRIMARY_PORT);
+    if (inet_pton(AF_INET, PRIMARY_HOST, &addr.sin_addr) != 1)
+    {
+        close(fd);
+        return -1;
+    }
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        close(fd);
+        return -1;
+    }
+
+    if (send_all(fd, "HEARTBEAT mirror1\n", 18) != 0)
+    {
+        close(fd);
+        return -1;
+    }
+
+    (void)recv_line(fd, line, sizeof(line));
+    close(fd);
+    return 0;
+}
+
+/*
+ * 功能：后台线程周期发送心跳。
+ * 实现原理：循环执行 send_heartbeat_once，间隔固定秒数。
+ */
+static void *heartbeat_thread_main(void *arg)
+{
+    (void)arg;
+
+    for (;;)
+    {
+        (void)send_heartbeat_once();
+        sleep(HEARTBEAT_INTERVAL_SEC);
+    }
+
+    return NULL;
+}
+
+/*
+ * 功能：启动心跳线程。
+ * 实现原理：创建并分离 pthread，让主线程继续进入服务循环。
+ */
+static void start_heartbeat_thread(void)
+{
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, heartbeat_thread_main, NULL) == 0)
+    {
+        (void)pthread_detach(tid);
+    }
 }
 
 /*
@@ -172,6 +291,10 @@ static int read_command_line(int client_fd, char *buf, size_t size)
 static int process_command(int client_fd, const char *cmd)
 {
     char resp[MAX_COMMAND_LEN + 64];
+    if (strcmp(cmd, "PING") == 0)
+    {
+        return send_all(client_fd, "PONG mirror1\n", 13);
+    }
 
     if (cmd == NULL)
     {
@@ -293,6 +416,8 @@ int main(void)
     /* 骨架默认监听所有网卡 */
     cfg.bind_host = "0.0.0.0";
     cfg.bind_port = DEFAULT_PORT;
+
+    start_heartbeat_thread();
 
     printf("%s starting on port %d (skeleton)\n", NODE_NAME, cfg.bind_port);
     return run_server(&cfg);

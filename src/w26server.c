@@ -8,12 +8,15 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 
 /* 主服务端基础配置 */
 #define NODE_NAME "w26server"
 #define DEFAULT_PORT 5000
 #define BACKLOG 16
 #define MAX_COMMAND_LEN 512
+#define STATUS_FILE "/tmp/w26_nodes_status.txt"
+#define HEARTBEAT_TTL_SEC 6
 
 typedef struct server_config
 {
@@ -46,6 +49,134 @@ static int send_all(int fd, const char *data, size_t len)
             return -1;
         }
         sent += (size_t)n;
+    }
+
+    return 0;
+}
+
+/*
+ * 功能：从状态文件读取镜像最近心跳时间。
+ * 实现原理：读取 /tmp 文本文件中的两个 epoch 秒值（mirror1 与 mirror2）。
+ */
+static int load_heartbeat_status(time_t *mirror1_ts, time_t *mirror2_ts)
+{
+    FILE *fp;
+    long t1 = 0;
+    long t2 = 0;
+
+    if (mirror1_ts == NULL || mirror2_ts == NULL)
+    {
+        return -1;
+    }
+
+    fp = fopen(STATUS_FILE, "r");
+    if (fp == NULL)
+    {
+        *mirror1_ts = (time_t)0;
+        *mirror2_ts = (time_t)0;
+        return -1;
+    }
+
+    if (fscanf(fp, "%ld %ld", &t1, &t2) != 2)
+    {
+        fclose(fp);
+        *mirror1_ts = (time_t)0;
+        *mirror2_ts = (time_t)0;
+        return -1;
+    }
+
+    fclose(fp);
+    *mirror1_ts = (time_t)t1;
+    *mirror2_ts = (time_t)t2;
+    return 0;
+}
+
+/*
+ * 功能：写入镜像最近心跳时间到状态文件。
+ * 实现原理：覆盖写入两个 epoch 秒值，供后续 GET_NODES 读取。
+ */
+static int save_heartbeat_status(time_t mirror1_ts, time_t mirror2_ts)
+{
+    FILE *fp;
+
+    fp = fopen(STATUS_FILE, "w");
+    if (fp == NULL)
+    {
+        return -1;
+    }
+
+    if (fprintf(fp, "%ld %ld\n", (long)mirror1_ts, (long)mirror2_ts) < 0)
+    {
+        fclose(fp);
+        return -1;
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+/*
+ * 功能：更新指定镜像节点的心跳时间。
+ * 实现原理：读取当前状态后仅更新目标节点时间戳，再写回状态文件。
+ */
+static int update_heartbeat(const char *node_name)
+{
+    time_t mirror1_ts = (time_t)0;
+    time_t mirror2_ts = (time_t)0;
+    time_t now = time(NULL);
+
+    if (node_name == NULL)
+    {
+        return -1;
+    }
+
+    (void)load_heartbeat_status(&mirror1_ts, &mirror2_ts);
+
+    if (strcmp(node_name, "mirror1") == 0)
+    {
+        mirror1_ts = now;
+    }
+    else if (strcmp(node_name, "mirror2") == 0)
+    {
+        mirror2_ts = now;
+    }
+    else
+    {
+        return -1;
+    }
+
+    return save_heartbeat_status(mirror1_ts, mirror2_ts);
+}
+
+/*
+ * 功能：生成节点在线表文本。
+ * 实现原理：主服务恒定在线，镜像按“当前时间 - 最近心跳时间 <= TTL”判定在线。
+ */
+static int build_nodes_status_line(char *out, size_t out_size)
+{
+    time_t mirror1_ts = (time_t)0;
+    time_t mirror2_ts = (time_t)0;
+    time_t now = time(NULL);
+    int mirror1_online;
+    int mirror2_online;
+
+    if (out == NULL || out_size == 0)
+    {
+        return -1;
+    }
+
+    (void)load_heartbeat_status(&mirror1_ts, &mirror2_ts);
+
+    mirror1_online = (mirror1_ts > 0 && (now - mirror1_ts) <= HEARTBEAT_TTL_SEC) ? 1 : 0;
+    mirror2_online = (mirror2_ts > 0 && (now - mirror2_ts) <= HEARTBEAT_TTL_SEC) ? 1 : 0;
+
+    if (snprintf(out,
+                 out_size,
+                 "NODES w26server=1 mirror1=%d mirror2=%d\n",
+                 mirror1_online,
+                 mirror2_online) < 0)
+    {
+        return -1;
     }
 
     return 0;
@@ -172,10 +303,35 @@ static int read_command_line(int client_fd, char *buf, size_t size)
 static int process_command(int client_fd, const char *cmd)
 {
     char resp[MAX_COMMAND_LEN + 64];
+    char nodes_line[128];
 
     if (cmd == NULL)
     {
         return -1;
+    }
+
+    if (strcmp(cmd, "PING") == 0)
+    {
+        return send_all(client_fd, "PONG w26server\n", 14);
+    }
+
+    if (strcmp(cmd, "GET_NODES") == 0)
+    {
+        if (build_nodes_status_line(nodes_line, sizeof(nodes_line)) != 0)
+        {
+            return send_all(client_fd, "NODES w26server=1 mirror1=0 mirror2=0\n", 38);
+        }
+        return send_all(client_fd, nodes_line, strlen(nodes_line));
+    }
+
+    if (strncmp(cmd, "HEARTBEAT ", 10) == 0)
+    {
+        const char *node_name = cmd + 10;
+        if (update_heartbeat(node_name) == 0)
+        {
+            return send_all(client_fd, "HB_OK\n", 6);
+        }
+        return send_all(client_fd, "HB_ERR\n", 7);
     }
 
     /* TODO: 在此实现真实命令分发（dirlist/fn/fz/ft/fdb/fda）。 */
@@ -293,6 +449,9 @@ int main(void)
     /* 默认监听所有网卡 */
     cfg.bind_host = "0.0.0.0";
     cfg.bind_port = DEFAULT_PORT;
+
+    /* 初始化状态文件，避免首次 GET_NODES 读取失败。 */
+    (void)save_heartbeat_status((time_t)0, (time_t)0);
 
     printf("%s starting on port %d (skeleton)\n", NODE_NAME, cfg.bind_port);
     return run_server(&cfg);
