@@ -29,6 +29,12 @@ typedef struct server_config
     int bind_port;
 } server_config_t;
 
+typedef struct dir_item
+{
+    char *name;
+    time_t ctime;
+} dir_item_t;
+
 /*
  * 功能：可靠发送指定长度的数据。
  * 实现原理：循环调用 send，处理 EINTR 中断，直到所有字节发送完成。
@@ -189,12 +195,29 @@ static void format_permissions(mode_t mode, char out[10])
     out[9] = '\0';
 }
 
-/* 功能：目录名排序比较器。实现原理：qsort 回调，内部调用 strcmp。 */
-static int cmp_string_ptr(const void *a, const void *b)
+/* 功能：目录名升序比较器。实现原理：qsort 回调，按 name 字段 strcmp。 */
+static int cmp_dir_by_name(const void *a, const void *b)
 {
-    const char *const *sa = (const char *const *)a;
-    const char *const *sb = (const char *const *)b;
-    return strcmp(*sa, *sb);
+    const dir_item_t *da = (const dir_item_t *)a;
+    const dir_item_t *db = (const dir_item_t *)b;
+    return strcmp(da->name, db->name);
+}
+
+/* 功能：目录时间升序比较器。实现原理：先比较 ctime，平手再比较名称。 */
+static int cmp_dir_by_ctime(const void *a, const void *b)
+{
+    const dir_item_t *da = (const dir_item_t *)a;
+    const dir_item_t *db = (const dir_item_t *)b;
+
+    if (da->ctime < db->ctime)
+    {
+        return -1;
+    }
+    if (da->ctime > db->ctime)
+    {
+        return 1;
+    }
+    return strcmp(da->name, db->name);
 }
 
 /* 功能：复制字符串。实现原理：手动申请内存并拷贝，避免依赖 strdup。 */
@@ -225,21 +248,28 @@ static const char *get_search_root(void)
     return (home != NULL && home[0] != '\0') ? home : ".";
 }
 
-/* 功能：处理 dirlist -a。实现原理：读取一级子目录并按字母序返回。 */
-static int handle_dirlist_a(int client_fd)
+/* 功能：收集 HOME 下一级子目录。实现原理：遍历目录并记录目录名与时间字段。 */
+static int collect_subdirs(dir_item_t **out_items, size_t *out_count)
 {
     const char *root = get_search_root();
     DIR *dir;
     struct dirent *ent;
-    char **names = NULL;
+    dir_item_t *items = NULL;
     size_t count = 0;
-    size_t i;
-    int rc = 0;
+    int ok = 0;
+
+    if (out_items == NULL || out_count == NULL)
+    {
+        return -1;
+    }
+
+    *out_items = NULL;
+    *out_count = 0;
 
     dir = opendir(root);
     if (dir == NULL)
     {
-        return send_all(client_fd, "No directory found\n", 19);
+        return -1;
     }
 
     while ((ent = readdir(dir)) != NULL)
@@ -247,7 +277,7 @@ static int handle_dirlist_a(int client_fd)
         char full[PATH_MAX];
         struct stat st;
         char *name_copy;
-        char **tmp;
+        dir_item_t *tmp;
 
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
         {
@@ -265,52 +295,111 @@ static int handle_dirlist_a(int client_fd)
         name_copy = dup_string(ent->d_name);
         if (name_copy == NULL)
         {
-            rc = -1;
+            ok = -1;
             break;
         }
-        tmp = (char **)realloc(names, (count + 1) * sizeof(char *));
+        tmp = (dir_item_t *)realloc(items, (count + 1) * sizeof(dir_item_t));
         if (tmp == NULL)
         {
             free(name_copy);
-            rc = -1;
+            ok = -1;
             break;
         }
-        names = tmp;
-        names[count++] = name_copy;
+        items = tmp;
+        items[count].name = name_copy;
+        items[count].ctime = st.st_ctime;
+        count++;
     }
     closedir(dir);
 
-    if (rc != 0)
+    if (ok != 0)
     {
+        size_t i;
         for (i = 0; i < count; ++i)
         {
-            free(names[i]);
+            free(items[i].name);
         }
-        free(names);
+        free(items);
         return -1;
     }
 
+    *out_items = items;
+    *out_count = count;
+    return 0;
+}
+
+/* 功能：以单行文本返回目录列表。实现原理：按指定顺序拼接目录名并换行结束。 */
+static int send_dirlist_line(int client_fd, dir_item_t *items, size_t count)
+{
+    size_t i;
+
     if (count == 0)
     {
-        free(names);
         return send_all(client_fd, "No directory found\n", 19);
     }
 
-    qsort(names, count, sizeof(char *), cmp_string_ptr);
     for (i = 0; i < count; ++i)
     {
-        if (send_all(client_fd, names[i], strlen(names[i])) != 0 || send_all(client_fd, "\n", 1) != 0)
+        if (send_all(client_fd, items[i].name, strlen(items[i].name)) != 0)
         {
-            rc = -1;
-            break;
+            return -1;
+        }
+        if (i + 1 < count)
+        {
+            if (send_all(client_fd, " ", 1) != 0)
+            {
+                return -1;
+            }
         }
     }
 
+    return send_all(client_fd, "\n", 1);
+}
+
+/* 功能：释放目录集合内存。实现原理：逐个释放 name，再释放数组本体。 */
+static void free_dir_items(dir_item_t *items, size_t count)
+{
+    size_t i;
     for (i = 0; i < count; ++i)
     {
-        free(names[i]);
+        free(items[i].name);
     }
-    free(names);
+    free(items);
+}
+
+/* 功能：处理 dirlist -a。实现原理：收集目录后按名称升序输出。 */
+static int handle_dirlist_a(int client_fd)
+{
+    dir_item_t *items = NULL;
+    size_t count = 0;
+    int rc;
+
+    if (collect_subdirs(&items, &count) != 0)
+    {
+        return send_all(client_fd, "No directory found\n", 19);
+    }
+
+    qsort(items, count, sizeof(dir_item_t), cmp_dir_by_name);
+    rc = send_dirlist_line(client_fd, items, count);
+    free_dir_items(items, count);
+    return rc;
+}
+
+/* 功能：处理 dirlist -t。实现原理：收集目录后按时间升序（最老优先）输出。 */
+static int handle_dirlist_t(int client_fd)
+{
+    dir_item_t *items = NULL;
+    size_t count = 0;
+    int rc;
+
+    if (collect_subdirs(&items, &count) != 0)
+    {
+        return send_all(client_fd, "No directory found\n", 19);
+    }
+
+    qsort(items, count, sizeof(dir_item_t), cmp_dir_by_ctime);
+    rc = send_dirlist_line(client_fd, items, count);
+    free_dir_items(items, count);
     return rc;
 }
 
@@ -536,6 +625,11 @@ static int process_command(int client_fd, const char *cmd)
     if (strcmp(cmd, "dirlist -a") == 0)
     {
         return handle_dirlist_a(client_fd);
+    }
+
+    if (strcmp(cmd, "dirlist -t") == 0)
+    {
+        return handle_dirlist_t(client_fd);
     }
 
     if (strncmp(cmd, "fn ", 3) == 0)

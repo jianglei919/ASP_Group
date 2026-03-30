@@ -95,7 +95,7 @@ static int validate_command(const char *line, char *err, size_t err_size)
         return 0;
     }
 
-    if (strcmp(line, "dirlist -a") == 0)
+    if (strcmp(line, "dirlist -a") == 0 || strcmp(line, "dirlist -t") == 0)
     {
         err[0] = '\0';
         return 0;
@@ -114,7 +114,7 @@ static int validate_command(const char *line, char *err, size_t err_size)
 
     if (parts >= 1 && strcmp(cmd, "dirlist") == 0)
     {
-        snprintf(err, err_size, "P1 currently supports only: dirlist -a");
+        snprintf(err, err_size, "P1 currently supports only: dirlist -a | dirlist -t");
         return -1;
     }
 
