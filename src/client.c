@@ -73,6 +73,11 @@ static int connect_to_server(const char *host, int port)
  */
 static int validate_command(const char *line, char *err, size_t err_size)
 {
+    char cmd[32];
+    char arg1[256];
+    char arg2[256];
+    int parts;
+
     if (line == NULL || err == NULL || err_size == 0)
     {
         return -1;
@@ -84,13 +89,49 @@ static int validate_command(const char *line, char *err, size_t err_size)
         return -1;
     }
 
-    /* TODO: 按作业规范实现完整语法校验（参数数量、类型、范围）。 */
-    /* TODO: 对 fz 检查 size1 <= size2 且均为非负整数。 */
-    /* TODO: 对 ft 限制扩展名个数为 1~3 且互不重复。 */
-    /* TODO: 对 fdb/fda 校验日期格式 YYYY-MM-DD。 */
-    /* TODO: 当前 P0 仅做非空检查，后续升级到严格校验。 */
-    err[0] = '\0';
-    return 0;
+    if (strcmp(line, "quitc") == 0)
+    {
+        err[0] = '\0';
+        return 0;
+    }
+
+    if (strcmp(line, "dirlist -a") == 0)
+    {
+        err[0] = '\0';
+        return 0;
+    }
+
+    cmd[0] = '\0';
+    arg1[0] = '\0';
+    arg2[0] = '\0';
+    parts = sscanf(line, "%31s %255s %255s", cmd, arg1, arg2);
+
+    if (parts == 2 && strcmp(cmd, "fn") == 0)
+    {
+        err[0] = '\0';
+        return 0;
+    }
+
+    if (parts >= 1 && strcmp(cmd, "dirlist") == 0)
+    {
+        snprintf(err, err_size, "P1 currently supports only: dirlist -a");
+        return -1;
+    }
+
+    if (parts >= 1 && strcmp(cmd, "fn") == 0)
+    {
+        snprintf(err, err_size, "usage: fn <filename>");
+        return -1;
+    }
+
+    if (strcmp(line, "GET_NODES") == 0)
+    {
+        err[0] = '\0';
+        return 0;
+    }
+
+    snprintf(err, err_size, "unsupported command in P1 (allowed: dirlist -a, fn <filename>, quitc)");
+    return -1;
 }
 
 /*

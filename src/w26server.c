@@ -3,10 +3,13 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 
@@ -183,6 +186,279 @@ static int build_nodes_status_line(char *out, size_t out_size)
 }
 
 /*
+ * 功能：将文件权限位转换为 rwx 字符串。
+ * 实现原理：按 POSIX mode 位逐位映射为 9 字符权限表示。
+ */
+static void format_permissions(mode_t mode, char out[10])
+{
+    out[0] = (mode & S_IRUSR) ? 'r' : '-';
+    out[1] = (mode & S_IWUSR) ? 'w' : '-';
+    out[2] = (mode & S_IXUSR) ? 'x' : '-';
+    out[3] = (mode & S_IRGRP) ? 'r' : '-';
+    out[4] = (mode & S_IWGRP) ? 'w' : '-';
+    out[5] = (mode & S_IXGRP) ? 'x' : '-';
+    out[6] = (mode & S_IROTH) ? 'r' : '-';
+    out[7] = (mode & S_IWOTH) ? 'w' : '-';
+    out[8] = (mode & S_IXOTH) ? 'x' : '-';
+    out[9] = '\0';
+}
+
+/*
+ * 功能：比较目录名字符串，供 qsort 排序使用。
+ * 实现原理：对字符串指针解引用后调用 strcmp。
+ */
+static int cmp_string_ptr(const void *a, const void *b)
+{
+    const char *const *sa = (const char *const *)a;
+    const char *const *sb = (const char *const *)b;
+    return strcmp(*sa, *sb);
+}
+
+/* 功能：复制字符串。实现原理：手动申请内存并拷贝，避免依赖 strdup。 */
+static char *dup_string(const char *s)
+{
+    size_t len;
+    char *p;
+
+    if (s == NULL)
+    {
+        return NULL;
+    }
+
+    len = strlen(s);
+    p = (char *)malloc(len + 1);
+    if (p == NULL)
+    {
+        return NULL;
+    }
+    memcpy(p, s, len + 1);
+    return p;
+}
+
+/*
+ * 功能：返回服务端搜索根目录。
+ * 实现原理：优先使用 HOME 环境变量，不存在时回退当前目录。
+ */
+static const char *get_search_root(void)
+{
+    const char *home = getenv("HOME");
+    return (home != NULL && home[0] != '\0') ? home : ".";
+}
+
+/*
+ * 功能：处理 dirlist -a 命令。
+ * 实现原理：读取 HOME 下一级子目录，按字母序排序并逐行返回。
+ */
+static int handle_dirlist_a(int client_fd)
+{
+    const char *root = get_search_root();
+    DIR *dir;
+    struct dirent *ent;
+    char **names = NULL;
+    size_t count = 0;
+    size_t i;
+    int rc = 0;
+
+    dir = opendir(root);
+    if (dir == NULL)
+    {
+        return send_all(client_fd, "No directory found\n", 19);
+    }
+
+    while ((ent = readdir(dir)) != NULL)
+    {
+        char full[PATH_MAX];
+        struct stat st;
+        char *name_copy;
+        char **tmp;
+
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+        {
+            continue;
+        }
+
+        if (snprintf(full, sizeof(full), "%s/%s", root, ent->d_name) < 0)
+        {
+            continue;
+        }
+
+        if (stat(full, &st) != 0 || !S_ISDIR(st.st_mode))
+        {
+            continue;
+        }
+
+        name_copy = dup_string(ent->d_name);
+        if (name_copy == NULL)
+        {
+            rc = -1;
+            break;
+        }
+
+        tmp = (char **)realloc(names, (count + 1) * sizeof(char *));
+        if (tmp == NULL)
+        {
+            free(name_copy);
+            rc = -1;
+            break;
+        }
+        names = tmp;
+        names[count++] = name_copy;
+    }
+    closedir(dir);
+
+    if (rc != 0)
+    {
+        for (i = 0; i < count; ++i)
+        {
+            free(names[i]);
+        }
+        free(names);
+        return -1;
+    }
+
+    if (count == 0)
+    {
+        free(names);
+        return send_all(client_fd, "No directory found\n", 19);
+    }
+
+    qsort(names, count, sizeof(char *), cmp_string_ptr);
+    for (i = 0; i < count; ++i)
+    {
+        size_t len = strlen(names[i]);
+        if (send_all(client_fd, names[i], len) != 0 || send_all(client_fd, "\n", 1) != 0)
+        {
+            rc = -1;
+            break;
+        }
+    }
+
+    for (i = 0; i < count; ++i)
+    {
+        free(names[i]);
+    }
+    free(names);
+    return rc;
+}
+
+/*
+ * 功能：递归查找首个同名文件。
+ * 实现原理：深度优先遍历目录树，命中即返回并终止后续搜索。
+ */
+static int find_first_file(const char *dir_path, const char *target_name, char *out_path, size_t out_size)
+{
+    DIR *dir;
+    struct dirent *ent;
+
+    dir = opendir(dir_path);
+    if (dir == NULL)
+    {
+        return 0;
+    }
+
+    while ((ent = readdir(dir)) != NULL)
+    {
+        char full[PATH_MAX];
+        struct stat st;
+
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+        {
+            continue;
+        }
+
+        if (snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name) < 0)
+        {
+            continue;
+        }
+
+        if (stat(full, &st) != 0)
+        {
+            continue;
+        }
+
+        if (S_ISDIR(st.st_mode))
+        {
+            if (find_first_file(full, target_name, out_path, out_size))
+            {
+                closedir(dir);
+                return 1;
+            }
+            continue;
+        }
+
+        if (S_ISREG(st.st_mode) && strcmp(ent->d_name, target_name) == 0)
+        {
+            if (snprintf(out_path, out_size, "%s", full) >= 0)
+            {
+                closedir(dir);
+                return 1;
+            }
+        }
+    }
+
+    closedir(dir);
+    return 0;
+}
+
+/*
+ * 功能：处理 fn filename 命令。
+ * 实现原理：递归查找首个同名文件，返回名称/大小/时间/权限等元数据。
+ */
+static int handle_fn(int client_fd, const char *filename)
+{
+    const char *root = get_search_root();
+    char path[PATH_MAX];
+    struct stat st;
+    char perm[10];
+    char time_buf[32];
+    struct tm *tm_info;
+    char resp[1024];
+    const char *base;
+
+    if (filename == NULL || filename[0] == '\0')
+    {
+        return send_all(client_fd, "File not found\n", 15);
+    }
+
+    if (!find_first_file(root, filename, path, sizeof(path)))
+    {
+        return send_all(client_fd, "File not found\n", 15);
+    }
+
+    if (stat(path, &st) != 0)
+    {
+        return send_all(client_fd, "File not found\n", 15);
+    }
+
+    format_permissions(st.st_mode, perm);
+    tm_info = localtime(&st.st_ctime);
+    if (tm_info == NULL)
+    {
+        snprintf(time_buf, sizeof(time_buf), "unknown");
+    }
+    else
+    {
+        (void)strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+    }
+
+    base = strrchr(path, '/');
+    base = (base != NULL) ? (base + 1) : path;
+
+    if (snprintf(resp,
+                 sizeof(resp),
+                 "filename=%s size=%ld created=%s permissions=%s\n",
+                 base,
+                 (long)st.st_size,
+                 time_buf,
+                 perm) < 0)
+    {
+        return -1;
+    }
+
+    return send_all(client_fd, resp, strlen(resp));
+}
+
+/*
  * 功能：创建并返回服务端监听套接字。
  * 实现原理：按 socket -> setsockopt -> bind -> listen 的顺序初始化 TCP 监听端口。
  */
@@ -332,6 +608,21 @@ static int process_command(int client_fd, const char *cmd)
             return send_all(client_fd, "HB_OK\n", 6);
         }
         return send_all(client_fd, "HB_ERR\n", 7);
+    }
+
+    if (strcmp(cmd, "dirlist -a") == 0)
+    {
+        return handle_dirlist_a(client_fd);
+    }
+
+    if (strncmp(cmd, "fn ", 3) == 0)
+    {
+        const char *filename = cmd + 3;
+        while (*filename == ' ')
+        {
+            filename++;
+        }
+        return handle_fn(client_fd, filename);
     }
 
     /* TODO: 在此实现真实命令分发（dirlist/fn/fz/ft/fdb/fda）。 */
