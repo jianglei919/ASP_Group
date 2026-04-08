@@ -2,7 +2,10 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <netinet/in.h>
+#include <stdlib.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
@@ -112,6 +115,39 @@ static int validate_command(const char *line, char *err, size_t err_size)
         return 0;
     }
 
+    if (parts == 3 && strcmp(cmd, "fz") == 0)
+    {
+        long n1;
+        long n2;
+        if (sscanf(line, "fz %ld %ld", &n1, &n2) == 2 && n1 >= 0 && n2 >= n1)
+        {
+            err[0] = '\0';
+            return 0;
+        }
+        snprintf(err, err_size, "usage: fz <size1> <size2> (size2 >= size1 >= 0)");
+        return -1;
+    }
+
+    if (parts >= 2 && parts <= 4 && strcmp(cmd, "ft") == 0)
+    {
+        err[0] = '\0';
+        return 0;
+    }
+
+    if (parts == 2 && (strcmp(cmd, "fdb") == 0 || strcmp(cmd, "fda") == 0))
+    {
+        int y;
+        int m;
+        int d;
+        if (sscanf(arg1, "%d-%d-%d", &y, &m, &d) == 3 && m >= 1 && m <= 12 && d >= 1 && d <= 31)
+        {
+            err[0] = '\0';
+            return 0;
+        }
+        snprintf(err, err_size, "usage: %s YYYY-MM-DD", cmd);
+        return -1;
+    }
+
     if (parts >= 1 && strcmp(cmd, "dirlist") == 0)
     {
         snprintf(err, err_size, "P1 currently supports only: dirlist -a | dirlist -t");
@@ -124,13 +160,31 @@ static int validate_command(const char *line, char *err, size_t err_size)
         return -1;
     }
 
+    if (parts >= 1 && strcmp(cmd, "fz") == 0)
+    {
+        snprintf(err, err_size, "usage: fz <size1> <size2>");
+        return -1;
+    }
+
+    if (parts >= 1 && strcmp(cmd, "ft") == 0)
+    {
+        snprintf(err, err_size, "usage: ft <ext1> [ext2] [ext3]");
+        return -1;
+    }
+
+    if (parts >= 1 && (strcmp(cmd, "fdb") == 0 || strcmp(cmd, "fda") == 0))
+    {
+        snprintf(err, err_size, "usage: %s YYYY-MM-DD", cmd);
+        return -1;
+    }
+
     if (strcmp(line, "GET_NODES") == 0)
     {
         err[0] = '\0';
         return 0;
     }
 
-    snprintf(err, err_size, "unsupported command in P1 (allowed: dirlist -a, fn <filename>, quitc)");
+    snprintf(err, err_size, "unsupported command (allowed: dirlist -a|-t, fn, fz, ft, fdb, fda, quitc)");
     return -1;
 }
 
@@ -193,13 +247,18 @@ static int send_command(int server_fd, const char *line)
  */
 static int receive_response(int server_fd)
 {
-    char buf[MAX_COMMAND_LEN + 128];
+    char line[MAX_COMMAND_LEN + 128];
+    const char *home;
+    char out_dir[PATH_MAX];
+    char out_path[PATH_MAX];
+    long file_size;
+    FILE *fp;
+    char buf[4096];
+    long received;
     size_t idx = 0;
 
-    /* TODO: 扩展为支持二进制文件响应并保存到 ~/project/temp.tar.gz。 */
-    /* TODO: 区分文本消息与文件流协议，避免把二进制当文本打印。 */
-    /* 按行读取服务端响应，便于快速验证通信链路 */
-    while (idx + 1 < sizeof(buf))
+    /* 先读取响应首行，用于区分文本响应与文件流响应。 */
+    while (idx + 1 < sizeof(line))
     {
         char ch;
         ssize_t n = recv(server_fd, &ch, 1, 0);
@@ -224,12 +283,72 @@ static int receive_response(int server_fd)
 
         if (ch != '\r')
         {
-            buf[idx++] = ch;
+            line[idx++] = ch;
         }
     }
 
-    buf[idx] = '\0';
-    printf("%s\n", buf);
+    line[idx] = '\0';
+
+    if (sscanf(line, "FILE %ld", &file_size) == 1 && file_size >= 0)
+    {
+        home = getenv("HOME");
+        if (home == NULL || home[0] == '\0')
+        {
+            home = ".";
+        }
+
+        if (snprintf(out_dir, sizeof(out_dir), "%s/project", home) < 0)
+        {
+            return -1;
+        }
+        if (mkdir(out_dir, 0755) != 0 && errno != EEXIST)
+        {
+            return -1;
+        }
+        if (snprintf(out_path, sizeof(out_path), "%s/temp.tar.gz", out_dir) < 0)
+        {
+            return -1;
+        }
+
+        fp = fopen(out_path, "wb");
+        if (fp == NULL)
+        {
+            return -1;
+        }
+
+        received = 0;
+        while (received < file_size)
+        {
+            size_t need = (size_t)((file_size - received) > (long)sizeof(buf) ? sizeof(buf) : (size_t)(file_size - received));
+            ssize_t n = recv(server_fd, buf, need, 0);
+            if (n < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                fclose(fp);
+                return -1;
+            }
+            if (n == 0)
+            {
+                fclose(fp);
+                return -1;
+            }
+            if (fwrite(buf, 1, (size_t)n, fp) != (size_t)n)
+            {
+                fclose(fp);
+                return -1;
+            }
+            received += (long)n;
+        }
+
+        fclose(fp);
+        printf("Received temp.tar.gz (%ld bytes) -> %s\n", file_size, out_path);
+        return 0;
+    }
+
+    printf("%s\n", line);
     return 0;
 }
 

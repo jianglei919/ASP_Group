@@ -5,12 +5,14 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 
 /* 主服务端基础配置 */
@@ -32,6 +34,30 @@ typedef struct dir_item
     char *name;
     time_t ctime;
 } dir_item_t;
+
+typedef struct file_list
+{
+    char **paths;
+    size_t count;
+} file_list_t;
+
+typedef struct size_filter
+{
+    off_t min_size;
+    off_t max_size;
+} size_filter_t;
+
+typedef struct ext_filter
+{
+    const char *exts[3];
+    int count;
+} ext_filter_t;
+
+typedef struct date_filter
+{
+    time_t threshold;
+    int before;
+} date_filter_t;
 
 /*
  * 功能：可靠发送指定长度的数据。
@@ -541,6 +567,478 @@ static int handle_fn(int client_fd, const char *filename)
     return send_all(client_fd, resp, strlen(resp));
 }
 
+/* 功能：向文件列表追加一条路径。实现原理：realloc 扩容并复制字符串。 */
+static int file_list_add(file_list_t *list, const char *path)
+{
+    char **tmp;
+    char *copy;
+
+    if (list == NULL || path == NULL)
+    {
+        return -1;
+    }
+
+    copy = dup_string(path);
+    if (copy == NULL)
+    {
+        return -1;
+    }
+
+    tmp = (char **)realloc(list->paths, (list->count + 1) * sizeof(char *));
+    if (tmp == NULL)
+    {
+        free(copy);
+        return -1;
+    }
+
+    list->paths = tmp;
+    list->paths[list->count++] = copy;
+    return 0;
+}
+
+/* 功能：释放文件列表。实现原理：逐项释放路径字符串，再释放数组。 */
+static void free_file_list(file_list_t *list)
+{
+    size_t i;
+
+    if (list == NULL)
+    {
+        return;
+    }
+
+    for (i = 0; i < list->count; ++i)
+    {
+        free(list->paths[i]);
+    }
+    free(list->paths);
+    list->paths = NULL;
+    list->count = 0;
+}
+
+/* 功能：判断文件是否匹配大小区间。实现原理：比较 st_size 是否位于 [min, max]。 */
+static int match_size_filter(const char *path, const struct stat *st, void *ctx)
+{
+    const size_filter_t *f = (const size_filter_t *)ctx;
+    (void)path;
+
+    if (st == NULL || f == NULL)
+    {
+        return 0;
+    }
+    return (st->st_size >= f->min_size && st->st_size <= f->max_size) ? 1 : 0;
+}
+
+/* 功能：判断文件是否匹配扩展名集合。实现原理：从文件名尾部提取后缀并做精确比对。 */
+static int match_ext_filter(const char *path, const struct stat *st, void *ctx)
+{
+    const ext_filter_t *f = (const ext_filter_t *)ctx;
+    const char *base;
+    const char *dot;
+    int i;
+    (void)st;
+
+    if (path == NULL || f == NULL || f->count <= 0)
+    {
+        return 0;
+    }
+
+    base = strrchr(path, '/');
+    base = (base != NULL) ? (base + 1) : path;
+    dot = strrchr(base, '.');
+    if (dot == NULL || dot[1] == '\0')
+    {
+        return 0;
+    }
+
+    for (i = 0; i < f->count; ++i)
+    {
+        if (f->exts[i] != NULL && strcmp(dot + 1, f->exts[i]) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* 功能：判断文件是否匹配日期条件。实现原理：比较 st_ctime 与阈值时间。 */
+static int match_date_filter(const char *path, const struct stat *st, void *ctx)
+{
+    const date_filter_t *f = (const date_filter_t *)ctx;
+    (void)path;
+
+    if (st == NULL || f == NULL)
+    {
+        return 0;
+    }
+
+    if (f->before)
+    {
+        return (st->st_ctime < f->threshold) ? 1 : 0;
+    }
+    return (st->st_ctime >= f->threshold) ? 1 : 0;
+}
+
+/* 功能：递归收集匹配文件。实现原理：DFS 遍历目录树，对常规文件应用过滤函数。 */
+static int collect_matching_files_recursive(const char *dir_path,
+                                            int (*matcher)(const char *, const struct stat *, void *),
+                                            void *ctx,
+                                            file_list_t *out)
+{
+    DIR *dir;
+    struct dirent *ent;
+
+    dir = opendir(dir_path);
+    if (dir == NULL)
+    {
+        return 0;
+    }
+
+    while ((ent = readdir(dir)) != NULL)
+    {
+        char full[PATH_MAX];
+        struct stat st;
+
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+        {
+            continue;
+        }
+        if (snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name) < 0)
+        {
+            continue;
+        }
+        if (stat(full, &st) != 0)
+        {
+            continue;
+        }
+
+        if (S_ISDIR(st.st_mode))
+        {
+            if (collect_matching_files_recursive(full, matcher, ctx, out) != 0)
+            {
+                closedir(dir);
+                return -1;
+            }
+            continue;
+        }
+
+        if (S_ISREG(st.st_mode) && matcher(full, &st, ctx))
+        {
+            if (file_list_add(out, full) != 0)
+            {
+                closedir(dir);
+                return -1;
+            }
+        }
+    }
+
+    closedir(dir);
+    return 0;
+}
+
+/* 功能：解析 YYYY-MM-DD 日期。实现原理：拆分年月日并通过 mktime 转为 time_t。 */
+static int parse_date_ymd(const char *s, time_t *out)
+{
+    int y;
+    int m;
+    int d;
+    struct tm tmv;
+    time_t t;
+
+    if (s == NULL || out == NULL)
+    {
+        return -1;
+    }
+
+    if (sscanf(s, "%d-%d-%d", &y, &m, &d) != 3)
+    {
+        return -1;
+    }
+    if (m < 1 || m > 12 || d < 1 || d > 31)
+    {
+        return -1;
+    }
+
+    memset(&tmv, 0, sizeof(tmv));
+    tmv.tm_year = y - 1900;
+    tmv.tm_mon = m - 1;
+    tmv.tm_mday = d;
+    tmv.tm_hour = 0;
+    tmv.tm_min = 0;
+    tmv.tm_sec = 0;
+    tmv.tm_isdst = -1;
+
+    t = mktime(&tmv);
+    if (t == (time_t)-1)
+    {
+        return -1;
+    }
+
+    *out = t;
+    return 0;
+}
+
+/* 功能：将文件列表打包为 tar.gz。实现原理：写入临时列表后调用 tar -T。 */
+static int create_temp_archive(const file_list_t *list, char *out_path, size_t out_size)
+{
+    char list_path[PATH_MAX];
+    FILE *list_fp;
+    size_t i;
+    pid_t pid;
+    time_t now;
+    pid_t child;
+    int status;
+    struct sigaction old_chld;
+    struct sigaction dfl_chld;
+
+    if (list == NULL || out_path == NULL || out_size == 0 || list->count == 0)
+    {
+        return -1;
+    }
+
+    pid = getpid();
+    now = time(NULL);
+    if (snprintf(out_path, out_size, "/tmp/w26_temp_%ld.tar.gz", (long)pid) < 0)
+    {
+        return -1;
+    }
+
+    if (snprintf(list_path, sizeof(list_path), "/tmp/w26_list_%ld_%ld.txt", (long)pid, (long)now) < 0)
+    {
+        return -1;
+    }
+
+    list_fp = fopen(list_path, "w");
+    if (list_fp == NULL)
+    {
+        return -1;
+    }
+
+    for (i = 0; i < list->count; ++i)
+    {
+        if (fprintf(list_fp, "%s\n", list->paths[i]) < 0)
+        {
+            fclose(list_fp);
+            unlink(list_path);
+            return -1;
+        }
+    }
+
+    if (fclose(list_fp) != 0)
+    {
+        unlink(list_path);
+        return -1;
+    }
+
+    memset(&dfl_chld, 0, sizeof(dfl_chld));
+    dfl_chld.sa_handler = SIG_DFL;
+    sigemptyset(&dfl_chld.sa_mask);
+    if (sigaction(SIGCHLD, &dfl_chld, &old_chld) != 0)
+    {
+        unlink(list_path);
+        unlink(out_path);
+        return -1;
+    }
+
+    child = fork();
+    if (child < 0)
+    {
+        (void)sigaction(SIGCHLD, &old_chld, NULL);
+        unlink(list_path);
+        unlink(out_path);
+        return -1;
+    }
+
+    if (child == 0)
+    {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0)
+        {
+            (void)dup2(devnull, STDOUT_FILENO);
+            (void)dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        execl("/usr/bin/tar", "tar", "-czf", out_path, "-T", list_path, (char *)NULL);
+        _exit(127);
+    }
+
+    if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    {
+        (void)sigaction(SIGCHLD, &old_chld, NULL);
+        unlink(list_path);
+        unlink(out_path);
+        return -1;
+    }
+
+    (void)sigaction(SIGCHLD, &old_chld, NULL);
+
+    unlink(list_path);
+    return 0;
+}
+
+/* 功能：发送压缩包给客户端。实现原理：先发 FILE 头，再按块发送二进制。 */
+static int send_archive_file(int client_fd, const char *archive_path)
+{
+    int fd;
+    struct stat st;
+    char header[64];
+    char buf[4096];
+
+    if (archive_path == NULL)
+    {
+        return -1;
+    }
+
+    if (stat(archive_path, &st) != 0 || !S_ISREG(st.st_mode))
+    {
+        return -1;
+    }
+
+    if (snprintf(header, sizeof(header), "FILE %ld\n", (long)st.st_size) < 0)
+    {
+        return -1;
+    }
+    if (send_all(client_fd, header, strlen(header)) != 0)
+    {
+        return -1;
+    }
+
+    fd = open(archive_path, O_RDONLY);
+    if (fd < 0)
+    {
+        return -1;
+    }
+
+    for (;;)
+    {
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            close(fd);
+            return -1;
+        }
+        if (n == 0)
+        {
+            break;
+        }
+        if (send_all(client_fd, buf, (size_t)n) != 0)
+        {
+            close(fd);
+            return -1;
+        }
+    }
+
+    close(fd);
+    return 0;
+}
+
+/* 功能：执行过滤打包并回传。实现原理：收集匹配文件，打包后发送 FILE 流。 */
+static int handle_archive_query(int client_fd,
+                                int (*matcher)(const char *, const struct stat *, void *),
+                                void *ctx)
+{
+    const char *root = get_search_root();
+    file_list_t list = {0};
+    char archive_path[PATH_MAX];
+    int rc;
+
+    rc = collect_matching_files_recursive(root, matcher, ctx, &list);
+    if (rc != 0)
+    {
+        free_file_list(&list);
+        return send_all(client_fd, "No file found\n", 14);
+    }
+    if (list.count == 0)
+    {
+        free_file_list(&list);
+        return send_all(client_fd, "No file found\n", 14);
+    }
+
+    if (create_temp_archive(&list, archive_path, sizeof(archive_path)) != 0)
+    {
+        free_file_list(&list);
+        return send_all(client_fd, "No file found\n", 14);
+    }
+
+    rc = send_archive_file(client_fd, archive_path);
+    unlink(archive_path);
+    free_file_list(&list);
+
+    if (rc != 0)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+/* 功能：处理 fz size1 size2。实现原理：按文件大小区间筛选并回传压缩包。 */
+static int handle_fz(int client_fd, const char *cmd)
+{
+    long min_size;
+    long max_size;
+    size_filter_t f;
+
+    if (sscanf(cmd, "fz %ld %ld", &min_size, &max_size) != 2 || min_size < 0 || max_size < min_size)
+    {
+        return send_all(client_fd, "No file found\n", 14);
+    }
+
+    f.min_size = (off_t)min_size;
+    f.max_size = (off_t)max_size;
+    return handle_archive_query(client_fd, match_size_filter, &f);
+}
+
+/* 功能：处理 ft ext...。实现原理：按最多 3 个扩展名筛选并回传压缩包。 */
+static int handle_ft(int client_fd, const char *cmd)
+{
+    char e1[32];
+    char e2[32];
+    char e3[32];
+    ext_filter_t f;
+    int parts;
+
+    e1[0] = '\0';
+    e2[0] = '\0';
+    e3[0] = '\0';
+    parts = sscanf(cmd, "ft %31s %31s %31s", e1, e2, e3);
+    if (parts < 1)
+    {
+        return send_all(client_fd, "No file found\n", 14);
+    }
+
+    memset(&f, 0, sizeof(f));
+    f.exts[0] = e1;
+    f.count = 1;
+    if (parts >= 2)
+    {
+        f.exts[1] = e2;
+        f.count = 2;
+    }
+    if (parts >= 3)
+    {
+        f.exts[2] = e3;
+        f.count = 3;
+    }
+
+    return handle_archive_query(client_fd, match_ext_filter, &f);
+}
+
+/* 功能：处理 fdb/fda 日期命令。实现原理：按 ctime 与阈值的前后关系筛选。 */
+static int handle_fdx(int client_fd, const char *date_str, int before)
+{
+    date_filter_t f;
+
+    if (parse_date_ymd(date_str, &f.threshold) != 0)
+    {
+        return send_all(client_fd, "No file found\n", 14);
+    }
+    f.before = before;
+    return handle_archive_query(client_fd, match_date_filter, &f);
+}
+
 /*
  * 功能：创建并返回服务端监听套接字。
  * 实现原理：按 socket -> setsockopt -> bind -> listen 的顺序初始化 TCP 监听端口。
@@ -663,6 +1161,7 @@ static int process_command(int client_fd, const char *cmd)
 {
     char resp[MAX_COMMAND_LEN + 64];
     char nodes_line[128];
+    char date_buf[32];
 
     if (cmd == NULL)
     {
@@ -711,6 +1210,26 @@ static int process_command(int client_fd, const char *cmd)
             filename++;
         }
         return handle_fn(client_fd, filename);
+    }
+
+    if (strncmp(cmd, "fz ", 3) == 0)
+    {
+        return handle_fz(client_fd, cmd);
+    }
+
+    if (strncmp(cmd, "ft ", 3) == 0)
+    {
+        return handle_ft(client_fd, cmd);
+    }
+
+    if (sscanf(cmd, "fdb %31s", date_buf) == 1)
+    {
+        return handle_fdx(client_fd, date_buf, 1);
+    }
+
+    if (sscanf(cmd, "fda %31s", date_buf) == 1)
+    {
+        return handle_fdx(client_fd, date_buf, 0);
     }
 
     /* TODO: 在此实现真实命令分发（dirlist/fn/fz/ft/fdb/fda）。 */

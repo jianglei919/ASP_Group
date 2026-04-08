@@ -8,7 +8,7 @@
 - mirror2（镜像服务 2）
 - client（客户端）
 
-当前代码为作业提交版骨架，核心业务逻辑保留了 TODO 标注，便于后续逐步实现。
+当前代码已实现 P0/P1/P2 的核心命令链路，包括文本响应与压缩包二进制回传。
 
 ## 2. 项目结构图
 ```text
@@ -183,7 +183,9 @@ quitc
 - .gitignore 已配置忽略 out 目录。
 - logs 目录由 `start_all_servers.sh` 自动生成，用于保存服务端日志。
 - .pids 目录由 `start_all_servers.sh` 自动生成，用于保存服务端 PID 文件。
-- 当前为骨架代码，未实现部分均以 TODO 标注。
+- 当前已支持命令：`dirlist -a`、`dirlist -t`、`fn <filename>`、`fz <size1> <size2>`、`ft <ext1> [ext2] [ext3]`、`fdb <YYYY-MM-DD>`、`fda <YYYY-MM-DD>`、`quitc`。
+- 当 `fz/ft/fdb/fda` 匹配到文件时，服务端按 `FILE <size>\n + 二进制数据` 协议发送压缩包，客户端保存到 `~/project/temp.tar.gz`。
+- 当查询范围过大（例如在大 HOME 目录执行 `fda`），遍历会耗时较长，属于当前实现的预期行为。
 
 ## 8. 状态发现协议
 当前实现采用“镜像主动心跳 + 主服务端在线表 + 客户端按可用性选路”。
