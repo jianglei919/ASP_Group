@@ -28,43 +28,56 @@
 
 typedef struct server_config
 {
+    /* 镜像服务监听地址，默认绑定全部网卡。 */
     const char *bind_host;
+    /* 镜像服务监听端口。 */
     int bind_port;
 } server_config_t;
 
 typedef struct dir_item
 {
+    /* 目录名（不含父路径）。 */
     char *name;
+    /* 目录时间戳，用于时间排序输出。 */
     time_t ctime;
 } dir_item_t;
 
 typedef struct file_list
 {
+    /* 匹配文件路径动态数组。 */
     char **paths;
+    /* 数组中的有效路径数量。 */
     size_t count;
 } file_list_t;
 
 typedef struct size_filter
 {
+    /* 文件大小下界（含）。 */
     off_t min_size;
+    /* 文件大小上界（含）。 */
     off_t max_size;
 } size_filter_t;
 
 typedef struct ext_filter
 {
+    /* 可接受的扩展名，最多 3 个。 */
     const char *exts[3];
+    /* 当前已解析出的扩展名个数。 */
     int count;
 } ext_filter_t;
 
 typedef struct date_filter
 {
+    /* 日期阈值时间戳。 */
     time_t threshold;
+    /* 1: 早于阈值(fdb)；0: 晚于等于阈值(fda)。 */
     int before;
 } date_filter_t;
 
 /*
  * 功能：可靠发送指定长度的数据。
- * 实现原理：循环调用 send，处理 EINTR 中断，直到所有字节发送完成。
+ * 实现原理：TCP 发送存在短写风险，因此维护 sent 偏移循环发送直到写满目标长度；
+ * send 被信号打断时按 EINTR 重试，返回 0 或不可恢复错误则视为连接异常并向上返回失败。
  */
 static int send_all(int fd, const char *data, size_t len)
 {
@@ -94,7 +107,8 @@ static int send_all(int fd, const char *data, size_t len)
 
 /*
  * 功能：按行接收文本响应。
- * 实现原理：逐字节读取直到换行，用于心跳应答消费。
+ * 实现原理：逐字节读取直到 '\n'，并过滤 CRLF 中的 '\r'，保证输出是标准 C 字符串。
+ * 该函数专门用于短文本协议（如心跳应答），避免一次 recv 粘包导致解析歧义。
  */
 static int recv_line(int fd, char *buf, size_t size)
 {
@@ -137,7 +151,8 @@ static int recv_line(int fd, char *buf, size_t size)
 
 /*
  * 功能：向主服务端发送一次心跳。
- * 实现原理：短连接发送 HEARTBEAT mirror1，并读取一行应答。
+ * 实现原理：每次心跳建立短连接，发送固定格式 HEARTBEAT 消息并读取单行应答后立即关闭。
+ * 这种无状态上报模型可避免长连接故障积累，异常时由下一周期重试恢复。
  */
 static int send_heartbeat_once(void)
 {
@@ -179,7 +194,8 @@ static int send_heartbeat_once(void)
 
 /*
  * 功能：后台线程周期发送心跳。
- * 实现原理：循环执行 send_heartbeat_once，间隔固定秒数。
+ * 实现原理：在线程内执行无限循环：上报一次心跳后 sleep 固定周期。
+ * 即使某次上报失败也不会终止线程，从而保持持续自愈的在线状态上报能力。
  */
 static void *heartbeat_thread_main(void *arg)
 {
@@ -196,7 +212,8 @@ static void *heartbeat_thread_main(void *arg)
 
 /*
  * 功能：启动心跳线程。
- * 实现原理：创建并分离 pthread，让主线程继续进入服务循环。
+ * 实现原理：创建后台线程并立即 detach，使其生命周期独立于主线程 join；
+ * 主线程可无阻塞进入监听循环，心跳与服务并发执行。
  */
 static void start_heartbeat_thread(void)
 {
@@ -207,7 +224,7 @@ static void start_heartbeat_thread(void)
     }
 }
 
-/* 功能：将文件权限位转换为 rwx 字符串。实现原理：按 mode 位逐位映射。 */
+/* 功能：将文件权限位转换为 rwx 字符串。实现原理：按 owner/group/other 顺序逐位映射，生成固定 9 字符权限串。 */
 static void format_permissions(mode_t mode, char out[10])
 {
     out[0] = (mode & S_IRUSR) ? 'r' : '-';
@@ -222,7 +239,7 @@ static void format_permissions(mode_t mode, char out[10])
     out[9] = '\0';
 }
 
-/* 功能：目录名升序比较器。实现原理：qsort 回调，按 name 字段 strcmp。 */
+/* 功能：目录名升序比较器。实现原理：作为 qsort 回调按字典序比较 name 字段，供 dirlist -a 复用。 */
 static int cmp_dir_by_name(const void *a, const void *b)
 {
     const dir_item_t *da = (const dir_item_t *)a;
@@ -230,7 +247,7 @@ static int cmp_dir_by_name(const void *a, const void *b)
     return strcmp(da->name, db->name);
 }
 
-/* 功能：目录时间升序比较器。实现原理：先比较 ctime，平手再比较名称。 */
+/* 功能：目录时间升序比较器。实现原理：先按 ctime 排序实现最老优先，若时间相同则按名称比较保证结果稳定。 */
 static int cmp_dir_by_ctime(const void *a, const void *b)
 {
     const dir_item_t *da = (const dir_item_t *)a;
@@ -247,7 +264,7 @@ static int cmp_dir_by_ctime(const void *a, const void *b)
     return strcmp(da->name, db->name);
 }
 
-/* 功能：复制字符串。实现原理：手动申请内存并拷贝，避免依赖 strdup。 */
+/* 功能：复制字符串。实现原理：显式 malloc+memcpy 生成独立副本，避免对非标准函数 strdup 的可移植性依赖。 */
 static char *dup_string(const char *s)
 {
     size_t len;
@@ -268,7 +285,7 @@ static char *dup_string(const char *s)
     return p;
 }
 
-/* 功能：返回搜索根目录。实现原理：优先 HOME，不存在则回退当前目录。 */
+/* 功能：返回搜索根目录。实现原理：优先使用 W26_SEARCH_ROOT，未设置时回退 HOME，再回退当前目录。 */
 static const char *get_search_root(void)
 {
     const char *custom = getenv("W26_SEARCH_ROOT");
@@ -281,7 +298,7 @@ static const char *get_search_root(void)
     return (home != NULL && home[0] != '\0') ? home : ".";
 }
 
-/* 功能：返回递归扫描最大深度。实现原理：读取环境变量并做范围校验。 */
+/* 功能：返回递归扫描最大深度。实现原理：读取 W26_MAX_SCAN_DEPTH 并进行数字与边界校验，非法值统一回落默认深度。 */
 static int get_max_scan_depth(void)
 {
     const char *s = getenv("W26_MAX_SCAN_DEPTH");
@@ -302,7 +319,7 @@ static int get_max_scan_depth(void)
     return (int)v;
 }
 
-/* 功能：收集 HOME 下一级子目录。实现原理：遍历目录并记录目录名与时间字段。 */
+/* 功能：收集搜索根下一级子目录。实现原理：遍历根目录，仅提取目录项并记录目录名与时间戳，供后续排序输出。 */
 static int collect_subdirs(dir_item_t **out_items, size_t *out_count)
 {
     const char *root = get_search_root();
@@ -382,7 +399,7 @@ static int collect_subdirs(dir_item_t **out_items, size_t *out_count)
     return 0;
 }
 
-/* 功能：以单行文本返回目录列表。实现原理：按指定顺序拼接目录名并换行结束。 */
+/* 功能：以单行文本返回目录列表。实现原理：按既定顺序将目录名以空格拼接并追加换行，便于客户端按行读取。 */
 static int send_dirlist_line(int client_fd, dir_item_t *items, size_t count)
 {
     size_t i;
@@ -410,7 +427,7 @@ static int send_dirlist_line(int client_fd, dir_item_t *items, size_t count)
     return send_all(client_fd, "\n", 1);
 }
 
-/* 功能：释放目录集合内存。实现原理：逐个释放 name，再释放数组本体。 */
+/* 功能：释放目录集合内存。实现原理：先释放每个 name，再释放承载数组，避免多次请求造成内存累积。 */
 static void free_dir_items(dir_item_t *items, size_t count)
 {
     size_t i;
@@ -421,7 +438,7 @@ static void free_dir_items(dir_item_t *items, size_t count)
     free(items);
 }
 
-/* 功能：处理 dirlist -a。实现原理：收集目录后按名称升序输出。 */
+/* 功能：处理 dirlist -a。实现原理：执行“收集->按名称排序->序列化发送->释放”的完整流程。 */
 static int handle_dirlist_a(int client_fd)
 {
     dir_item_t *items = NULL;
@@ -439,7 +456,7 @@ static int handle_dirlist_a(int client_fd)
     return rc;
 }
 
-/* 功能：处理 dirlist -t。实现原理：收集目录后按时间升序（最老优先）输出。 */
+/* 功能：处理 dirlist -t。实现原理：执行“收集->按时间排序->序列化发送->释放”的完整流程。 */
 static int handle_dirlist_t(int client_fd)
 {
     dir_item_t *items = NULL;
@@ -457,7 +474,7 @@ static int handle_dirlist_t(int client_fd)
     return rc;
 }
 
-/* 功能：递归查找首个同名文件。实现原理：目录树深度优先遍历。 */
+/* 功能：递归查找首个同名文件。实现原理：对目录树做 DFS，命中即逐层返回，减少无意义遍历开销。 */
 static int find_first_file(const char *dir_path, const char *target_name, char *out_path, size_t out_size)
 {
     DIR *dir = opendir(dir_path);
@@ -509,7 +526,7 @@ static int find_first_file(const char *dir_path, const char *target_name, char *
     return 0;
 }
 
-/* 功能：处理 fn filename。实现原理：查找文件并返回元信息。 */
+/* 功能：处理 fn filename。实现原理：先定位首个命中文件，再读取 stat 元数据并格式化为单行协议文本返回。 */
 static int handle_fn(int client_fd, const char *filename)
 {
     const char *root = get_search_root();
@@ -551,7 +568,7 @@ static int handle_fn(int client_fd, const char *filename)
     return send_all(client_fd, resp, strlen(resp));
 }
 
-/* 功能：向文件列表追加一条路径。实现原理：realloc 扩容并复制字符串。 */
+/* 功能：向文件列表追加一条路径。实现原理：先复制路径字符串，再通过 realloc 扩容数组并追加到尾部。 */
 static int file_list_add(file_list_t *list, const char *path)
 {
     char **tmp;
@@ -580,7 +597,7 @@ static int file_list_add(file_list_t *list, const char *path)
     return 0;
 }
 
-/* 功能：释放文件列表。实现原理：逐项释放路径字符串，再释放数组。 */
+/* 功能：释放文件列表。实现原理：与构建顺序相反逐项释放，确保错误路径也能完整回收内存。 */
 static void free_file_list(file_list_t *list)
 {
     size_t i;
@@ -599,7 +616,7 @@ static void free_file_list(file_list_t *list)
     list->count = 0;
 }
 
-/* 功能：判断文件是否匹配大小区间。实现原理：比较 st_size 是否位于 [min, max]。 */
+/* 功能：判断文件是否匹配大小区间。实现原理：按闭区间比较 st_size，作为 fz 命令过滤回调统一复用。 */
 static int match_size_filter(const char *path, const struct stat *st, void *ctx)
 {
     const size_filter_t *f = (const size_filter_t *)ctx;
@@ -612,7 +629,7 @@ static int match_size_filter(const char *path, const struct stat *st, void *ctx)
     return (st->st_size >= f->min_size && st->st_size <= f->max_size) ? 1 : 0;
 }
 
-/* 功能：判断文件是否匹配扩展名集合。实现原理：从文件名尾部提取后缀并做精确比对。 */
+/* 功能：判断文件是否匹配扩展名集合。实现原理：提取 basename 的最后扩展名并与过滤列表逐项精确匹配。 */
 static int match_ext_filter(const char *path, const struct stat *st, void *ctx)
 {
     const ext_filter_t *f = (const ext_filter_t *)ctx;
@@ -644,7 +661,7 @@ static int match_ext_filter(const char *path, const struct stat *st, void *ctx)
     return 0;
 }
 
-/* 功能：判断文件是否匹配日期条件。实现原理：比较 st_ctime 与阈值时间。 */
+/* 功能：判断文件是否匹配日期条件。实现原理：依据 before 标志执行“早于阈值”或“晚于等于阈值”比较。 */
 static int match_date_filter(const char *path, const struct stat *st, void *ctx)
 {
     const date_filter_t *f = (const date_filter_t *)ctx;
@@ -662,7 +679,7 @@ static int match_date_filter(const char *path, const struct stat *st, void *ctx)
     return (st->st_ctime >= f->threshold) ? 1 : 0;
 }
 
-/* 功能：递归收集匹配文件。实现原理：DFS 遍历目录树，对常规文件应用过滤函数。 */
+/* 功能：递归收集匹配文件。实现原理：先做深度上限检查，再 DFS 遍历；目录下探、文件匹配、失败上抛。 */
 static int collect_matching_files_recursive(const char *dir_path,
                                             int (*matcher)(const char *, const struct stat *, void *),
                                             void *ctx,
@@ -726,7 +743,7 @@ static int collect_matching_files_recursive(const char *dir_path,
     return 0;
 }
 
-/* 功能：解析 YYYY-MM-DD 日期。实现原理：拆分年月日并通过 mktime 转为 time_t。 */
+/* 功能：解析 YYYY-MM-DD 日期。实现原理：先做格式与范围校验，再构造 struct tm 并用 mktime 转为本地时间戳。 */
 static int parse_date_ymd(const char *s, time_t *out)
 {
     int y;
@@ -768,7 +785,7 @@ static int parse_date_ymd(const char *s, time_t *out)
     return 0;
 }
 
-/* 功能：将文件列表打包为 tar.gz。实现原理：写入临时列表后调用 tar -T。 */
+/* 功能：将文件列表打包为 tar.gz。实现原理：先写临时清单，再 fork+execl 调 tar，父进程 waitpid 校验退出码并清理。 */
 static int create_temp_archive(const file_list_t *list, char *out_path, size_t out_size)
 {
     char list_path[PATH_MAX];
@@ -866,7 +883,7 @@ static int create_temp_archive(const file_list_t *list, char *out_path, size_t o
     return 0;
 }
 
-/* 功能：发送压缩包给客户端。实现原理：先发 FILE 头，再按块发送二进制。 */
+/* 功能：发送压缩包给客户端。实现原理：先发送 FILE 大小头定义文本/二进制边界，再分块 read+send 直到 EOF。 */
 static int send_archive_file(int client_fd, const char *archive_path)
 {
     int fd;
@@ -926,7 +943,7 @@ static int send_archive_file(int client_fd, const char *archive_path)
     return 0;
 }
 
-/* 功能：执行过滤打包并回传。实现原理：收集匹配文件，打包后发送 FILE 流。 */
+/* 功能：执行过滤打包并回传。实现原理：统一执行“扫描->空集判定->打包->发送->清理”的流水线。 */
 static int handle_archive_query(int client_fd,
                                 int (*matcher)(const char *, const struct stat *, void *),
                                 void *ctx)
@@ -966,7 +983,7 @@ static int handle_archive_query(int client_fd,
     return 0;
 }
 
-/* 功能：处理 fz size1 size2。实现原理：按文件大小区间筛选并回传压缩包。 */
+/* 功能：处理 fz size1 size2。实现原理：解析并校验区间参数后构造 size_filter，复用统一归档发送流程。 */
 static int handle_fz(int client_fd, const char *cmd)
 {
     long min_size;
@@ -983,7 +1000,7 @@ static int handle_fz(int client_fd, const char *cmd)
     return handle_archive_query(client_fd, match_size_filter, &f);
 }
 
-/* 功能：处理 ft ext...。实现原理：按最多 3 个扩展名筛选并回传压缩包。 */
+/* 功能：处理 ft ext...。实现原理：解析最多 3 个扩展名并封装 ext_filter，复用统一归档发送流程。 */
 static int handle_ft(int client_fd, const char *cmd)
 {
     char e1[32];
@@ -1018,7 +1035,7 @@ static int handle_ft(int client_fd, const char *cmd)
     return handle_archive_query(client_fd, match_ext_filter, &f);
 }
 
-/* 功能：处理 fdb/fda 日期命令。实现原理：按 ctime 与阈值的前后关系筛选。 */
+/* 功能：处理 fdb/fda 日期命令。实现原理：将日期字符串转阈值时间后按方向过滤，再复用统一归档发送流程。 */
 static int handle_fdx(int client_fd, const char *date_str, int before)
 {
     date_filter_t f;
@@ -1033,7 +1050,7 @@ static int handle_fdx(int client_fd, const char *date_str, int before)
 
 /*
  * 功能：创建并返回服务端监听套接字。
- * 实现原理：按 socket -> setsockopt -> bind -> listen 的顺序初始化 TCP 监听端口。
+ * 实现原理：按 socket->setsockopt->bind->listen 典型流程创建监听端点，任一步失败都释放已申请资源。
  */
 static int create_listen_socket(const server_config_t *cfg)
 {
@@ -1096,7 +1113,7 @@ static int create_listen_socket(const server_config_t *cfg)
 
 /*
  * 功能：从客户端连接读取一条命令行。
- * 实现原理：逐字节 recv，遇到换行结束，过滤 '\r'，并确保缓冲区以 '\0' 结尾。
+ * 实现原理：逐字节读取到换行并过滤 '\r'；返回值区分“正常一行/对端关闭/错误”，供会话循环精确分支。
  */
 static int read_command_line(int client_fd, char *buf, size_t size)
 {
@@ -1147,7 +1164,7 @@ static int read_command_line(int client_fd, char *buf, size_t size)
 
 /*
  * 功能：处理单条客户端命令并返回响应。
- * 实现原理：当前 P0 使用 ACK 占位响应，后续在此扩展真实命令逻辑。
+ * 实现原理：按优先级顺序匹配协议命令，先处理控制与轻量命令，再进入检索归档命令；未匹配命令走 ACK 回退。
  */
 static int process_command(int client_fd, const char *cmd)
 {
@@ -1216,7 +1233,7 @@ static int process_command(int client_fd, const char *cmd)
 
 /*
  * 功能：处理单个客户端会话生命周期。
- * 实现原理：循环读取命令并分发，收到 quitc 或连接异常时结束会话。
+ * 实现原理：子进程中执行“读一行->分发->回包”循环，quitc 主动回 BYE；异常或断连即结束会话。
  */
 static void crequest(int client_fd)
 {
@@ -1248,7 +1265,7 @@ static void crequest(int client_fd)
 
 /*
  * 功能：启动服务端主循环并并发处理客户端。
- * 实现原理：accept 新连接后 fork 子进程处理会话，父进程继续监听。
+ * 实现原理：父进程长期 accept，新连接即 fork 子进程独立处理，父进程关闭客户端 fd 后继续监听，实现进程级并发。
  */
 static int run_server(const server_config_t *cfg)
 {
@@ -1307,7 +1324,7 @@ static int run_server(const server_config_t *cfg)
 
 /*
  * 功能：程序入口，初始化配置并启动镜像服务端1。
- * 实现原理：构造 server_config 后调用 run_server。
+ * 实现原理：配置监听参数并启动心跳线程，然后进入 run_server 监听循环，使上报与服务并行运行。
  */
 int main(void)
 {

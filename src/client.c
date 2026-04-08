@@ -23,14 +23,19 @@
 
 typedef struct node_info
 {
+    /* 节点逻辑名，用于日志与状态识别。 */
     const char *name;
+    /* 节点 IP/主机地址。 */
     const char *host;
+    /* 节点服务端口。 */
     int port;
+    /* 在线标记：1 在线，0 离线。 */
     int online;
 } node_info_t;
 
 typedef struct nodes_cache
 {
+    /* 上次成功刷新在线表的时间戳。 */
     time_t last_refresh_ts;
 } nodes_cache_t;
 
@@ -291,6 +296,7 @@ static int receive_response(int server_fd)
 
     if (sscanf(line, "FILE %ld", &file_size) == 1 && file_size >= 0)
     {
+        /* 约定：归档始终写入 ~/project/temp.tar.gz，便于老师与脚本统一检查。 */
         home = getenv("HOME");
         if (home == NULL || home[0] == '\0')
         {
@@ -317,6 +323,7 @@ static int receive_response(int server_fd)
         }
 
         received = 0;
+        /* 以协议头中的字节数为准严格读取，防止多读到后续命令响应。 */
         while (received < file_size)
         {
             size_t need = (size_t)((file_size - received) > (long)sizeof(buf) ? sizeof(buf) : (size_t)(file_size - received));
@@ -536,6 +543,7 @@ int main(void)
             continue;
         }
 
+        /* 优先使用缓存在线表，减少每条命令都访问主服务端的状态开销。 */
         refresh_nodes_status(nodes, &cache, 0);
         preferred_idx = preferred_index_by_seq(request_seq);
         chosen_idx = choose_node_index(nodes, preferred_idx);
@@ -551,6 +559,7 @@ int main(void)
             }
         }
 
+        /* 以首选节点为起点轮询尝试，确保节点短暂故障时能自动旁路。 */
         for (attempt = 0; attempt < 3; ++attempt)
         {
             int idx = (chosen_idx + attempt) % 3;
