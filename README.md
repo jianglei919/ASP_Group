@@ -137,6 +137,12 @@ make clean && make
 ./scripts/start_all_servers.sh
 ```
 
+按参数控制扫描根目录和递归深度：
+
+```bash
+./scripts/start_all_servers.sh --root /path/to/search --depth 6
+```
+
 查看服务端状态：
 
 ```bash
@@ -161,6 +167,7 @@ make clean && make
 - `scripts/run_mirror2.sh`：前台启动镜像服务端 2。
 - `scripts/run_client.sh`：前台启动客户端。
 - `scripts/start_all_servers.sh`：后台一键启动 3 个服务端，并记录 PID 与日志。
+    - 可选参数：`--root <path>`、`--depth <1-64>`。
 - `scripts/server_status.sh`：检查 3 个服务端的 PID 与运行状态。
 - `scripts/stop_all_servers.sh`：根据 PID 文件停止全部服务端。
 
@@ -185,7 +192,10 @@ quitc
 - .pids 目录由 `start_all_servers.sh` 自动生成，用于保存服务端 PID 文件。
 - 当前已支持命令：`dirlist -a`、`dirlist -t`、`fn <filename>`、`fz <size1> <size2>`、`ft <ext1> [ext2] [ext3]`、`fdb <YYYY-MM-DD>`、`fda <YYYY-MM-DD>`、`quitc`。
 - 当 `fz/ft/fdb/fda` 匹配到文件时，服务端按 `FILE <size>\n + 二进制数据` 协议发送压缩包，客户端保存到 `~/project/temp.tar.gz`。
-- 当查询范围过大（例如在大 HOME 目录执行 `fda`），遍历会耗时较长，属于当前实现的预期行为。
+- 支持环境变量控制扫描范围与开销：
+    - `W26_SEARCH_ROOT`：覆盖默认搜索根目录（默认 `HOME`）。
+    - `W26_MAX_SCAN_DEPTH`：限制递归深度，默认 `8`，取值范围 `1-64`。
+- 在大目录执行 `fda/fdb` 时，建议设置较小 `W26_SEARCH_ROOT` 和 `W26_MAX_SCAN_DEPTH` 以避免耗时过长。
 
 ## 8. 状态发现协议
 当前实现采用“镜像主动心跳 + 主服务端在线表 + 客户端按可用性选路”。

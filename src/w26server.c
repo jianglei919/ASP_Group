@@ -22,6 +22,7 @@
 #define MAX_COMMAND_LEN 512
 #define STATUS_FILE "/tmp/w26_nodes_status.txt"
 #define HEARTBEAT_TTL_SEC 6
+#define DEFAULT_MAX_SCAN_DEPTH 8
 
 typedef struct server_config
 {
@@ -287,8 +288,35 @@ static char *dup_string(const char *s)
  */
 static const char *get_search_root(void)
 {
+    const char *custom = getenv("W26_SEARCH_ROOT");
     const char *home = getenv("HOME");
+
+    if (custom != NULL && custom[0] != '\0')
+    {
+        return custom;
+    }
     return (home != NULL && home[0] != '\0') ? home : ".";
+}
+
+/* 功能：返回递归扫描最大深度。实现原理：读取环境变量并做范围校验。 */
+static int get_max_scan_depth(void)
+{
+    const char *s = getenv("W26_MAX_SCAN_DEPTH");
+    char *end = NULL;
+    long v;
+
+    if (s == NULL || s[0] == '\0')
+    {
+        return DEFAULT_MAX_SCAN_DEPTH;
+    }
+
+    v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v < 1 || v > 64)
+    {
+        return DEFAULT_MAX_SCAN_DEPTH;
+    }
+
+    return (int)v;
 }
 
 /* 功能：收集 HOME 下一级子目录。实现原理：遍历目录并记录目录名与时间字段。 */
@@ -682,10 +710,17 @@ static int match_date_filter(const char *path, const struct stat *st, void *ctx)
 static int collect_matching_files_recursive(const char *dir_path,
                                             int (*matcher)(const char *, const struct stat *, void *),
                                             void *ctx,
-                                            file_list_t *out)
+                                            file_list_t *out,
+                                            int depth,
+                                            int max_depth)
 {
     DIR *dir;
     struct dirent *ent;
+
+    if (depth > max_depth)
+    {
+        return 0;
+    }
 
     dir = opendir(dir_path);
     if (dir == NULL)
@@ -713,7 +748,7 @@ static int collect_matching_files_recursive(const char *dir_path,
 
         if (S_ISDIR(st.st_mode))
         {
-            if (collect_matching_files_recursive(full, matcher, ctx, out) != 0)
+            if (collect_matching_files_recursive(full, matcher, ctx, out, depth + 1, max_depth) != 0)
             {
                 closedir(dir);
                 return -1;
@@ -941,11 +976,12 @@ static int handle_archive_query(int client_fd,
                                 void *ctx)
 {
     const char *root = get_search_root();
+    int max_depth = get_max_scan_depth();
     file_list_t list = {0};
     char archive_path[PATH_MAX];
     int rc;
 
-    rc = collect_matching_files_recursive(root, matcher, ctx, &list);
+    rc = collect_matching_files_recursive(root, matcher, ctx, &list, 0, max_depth);
     if (rc != 0)
     {
         free_file_list(&list);
@@ -1232,10 +1268,7 @@ static int process_command(int client_fd, const char *cmd)
         return handle_fdx(client_fd, date_buf, 0);
     }
 
-    /* TODO: 在此实现真实命令分发（dirlist/fn/fz/ft/fdb/fda）。 */
-    /* TODO: 根据命令结果返回规范消息，如 File not found / No file found。 */
-    /* TODO: 对打包类命令返回 temp.tar.gz（二进制传输）。 */
-    /* P0 阶段返回占位 ACK，后续在此接入真实命令处理 */
+    /* 未识别命令返回 ACK，便于调试扩展命令分发。 */
     if (snprintf(resp, sizeof(resp), "ACK from %s: %s\n", NODE_NAME, cmd) < 0)
     {
         return -1;
