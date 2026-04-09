@@ -26,52 +26,46 @@
 #define MAX_COMMAND_LEN 512
 #define DEFAULT_MAX_SCAN_DEPTH 8
 
+// 服务端配置结构体
 typedef struct server_config
 {
-    /* 镜像服务监听地址，默认绑定全部网卡。 */
-    const char *bind_host;
-    /* 镜像服务监听端口。 */
-    int bind_port;
+    const char *bind_host; // 监听地址，通常使用 0.0.0.0 绑定所有网卡
+    int bind_port;         // 监听端口，客户端与镜像节点都通过该端口访问主服务
 } server_config_t;
 
+// 目录项结构体
 typedef struct dir_item
 {
-    /* 目录名（不含父路径）。 */
-    char *name;
-    /* 目录时间戳，用于时间排序输出。 */
-    time_t ctime;
+    char *name;   // 目录名（不含父路径），用于输出 dirlist 结果
+    time_t ctime; // 目录时间戳，用于 dirlist -t 排序
 } dir_item_t;
 
+// 文件列表结构体
 typedef struct file_list
 {
-    /* 匹配文件路径动态数组。 */
-    char **paths;
-    /* 数组中的有效路径数量。 */
-    size_t count;
+    char **paths; // 动态路径数组，每个元素是命中文件的绝对路径
+    size_t count; // 当前命中文件数量
 } file_list_t;
 
+// 大小过滤器结构体
 typedef struct size_filter
 {
-    /* 文件大小下界（含）。 */
-    off_t min_size;
-    /* 文件大小上界（含）。 */
-    off_t max_size;
+    off_t min_size; // 文件大小下界（含）
+    off_t max_size; // 文件大小上界（含）
 } size_filter_t;
 
+// 扩展名过滤器结构体
 typedef struct ext_filter
 {
-    /* 可接受的扩展名，最多 3 个。 */
-    const char *exts[3];
-    /* 当前已解析出的扩展名个数。 */
-    int count;
+    const char *exts[3]; // 允许的扩展名集合，最多 3 个
+    int count;           // 有效扩展名个数。
 } ext_filter_t;
 
+// 日期过滤器结构体
 typedef struct date_filter
 {
-    /* 日期阈值时间戳。 */
-    time_t threshold;
-    /* 1: 早于阈值(fdb)；0: 晚于等于阈值(fda)。 */
-    int before;
+    time_t threshold; // 日期阈值时间戳（本地时区）
+    int before;       // 1 表示 fdb(早于阈值)，0 表示 fda(晚于等于阈值)。
 } date_filter_t;
 
 /*
@@ -181,6 +175,10 @@ static int send_heartbeat_once(void)
         return -1;
     }
 
+    /*
+     * 发送 "HEARTBEAT mirror2\n"，w26server 的 crequest() 会识别 HEARTBEAT 前缀，
+     * 更新状态文件中 mirror2 的时间戳并回复 HB_OK，不消耗客户端连接序号。
+     */
     if (send_all(fd, "HEARTBEAT mirror2\n", 18) != 0)
     {
         close(fd);
@@ -1175,6 +1173,20 @@ static int process_command(int client_fd, const char *cmd)
     {
         return send_all(client_fd, "PONG mirror2\n", 13);
     }
+
+    /*
+     * CONNECT_PROBE: 客户端被 w26server REDIRECT 到本节点后发送的探测命令。
+     * 回复 "CONNECTED mirrorN host port"，客户端据此确认已到达最终服务节点并显示节点信息。
+     */
+    if (strcmp(cmd, "CONNECT_PROBE") == 0)
+    {
+        char line_buf[128];
+        snprintf(line_buf, sizeof(line_buf),
+                 "CONNECTED %s %s %d\n",
+                 NODE_NAME, "127.0.0.1", DEFAULT_PORT);
+        return send_all(client_fd, line_buf, strlen(line_buf));
+    }
+
     if (strcmp(cmd, "dirlist -a") == 0)
     {
         return handle_dirlist_a(client_fd);
@@ -1330,8 +1342,6 @@ static int run_server(const server_config_t *cfg)
 int main(void)
 {
     server_config_t cfg;
-    /* TODO: 从命令行参数或配置文件读取监听地址与端口。 */
-    /* TODO: 增加日志级别、守护进程模式等运行参数。 */
     /* 默认监听所有网卡。 */
     cfg.bind_host = "0.0.0.0";
     cfg.bind_port = DEFAULT_PORT;

@@ -70,9 +70,20 @@ if [[ ! -x "./out/w26server" || ! -x "./out/mirror1" || ! -x "./out/mirror2" ]];
     exit 1
 fi
 
-# 如果已有旧进程，先提示并退出，避免重复启动
-if [[ -f "$PID_DIR/w26server.pid" || -f "$PID_DIR/mirror1.pid" || -f "$PID_DIR/mirror2.pid" ]]; then
-    echo "Error: pid files exist. Run scripts/stop_all_servers.sh first."
+# 如果已有旧进程在运行则退出；若进程已死则自动清理残留 pid 文件
+_has_live=false
+for _pidfile in "$PID_DIR"/*.pid; do
+    [[ -f "$_pidfile" ]] || continue
+    _pid=$(<"$_pidfile")
+    if kill -0 "$_pid" 2>/dev/null; then
+        _has_live=true
+        echo "Error: $(basename "$_pidfile" .pid) (pid $_pid) is still running."
+    else
+        rm -f "$_pidfile"
+    fi
+done
+if $_has_live; then
+    echo "Run scripts/stop_all_servers.sh first."
     exit 1
 fi
 

@@ -21,6 +21,7 @@
 #define BACKLOG 16
 #define MAX_COMMAND_LEN 512
 #define STATUS_FILE "/tmp/w26_nodes_status.txt"
+#define CLIENT_SEQ_FILE "/tmp/w26_client_seq.txt"
 #define HEARTBEAT_TTL_SEC 6
 #define DEFAULT_MAX_SCAN_DEPTH 8
 #define MIRROR1_HOST "127.0.0.1"
@@ -1222,7 +1223,16 @@ static int read_command_line(int client_fd, char *buf, size_t size)
     return 1;
 }
 
-/* 功能：按题目连接序号规则计算优先节点。实现原理：1-2 主服、3-4 mirror1、5-6 mirror2，7 起循环。 */
+/*
+ * 功能：按连接序号规则计算该客户端应路由到哪个节点。
+ * 路由规则：
+ *   seq 1-2  → index 0 (w26server 本地处理)
+ *   seq 3-4  → index 1 (mirror1)
+ *   seq 5-6  → index 2 (mirror2)
+ *   seq >= 7 → 按 (seq-7) % 3 循环: 0→w26server, 1→mirror1, 2→mirror2
+ * 即第 7,10,13... 回到 w26server，第 8,11,14... 去 mirror1，第 9,12,15... 去 mirror2。
+ * 返回值：0=w26server, 1=mirror1, 2=mirror2
+ */
 static int preferred_index_by_seq(long seq)
 {
     if (seq <= 2)
@@ -1238,6 +1248,69 @@ static int preferred_index_by_seq(long seq)
         return 2;
     }
     return (int)((seq - 7) % 3);
+}
+
+/*
+ * 功能：原子递增客户端连接序号并返回递增前的值。
+ * 实现原理：
+ *   w26server 采用 fork-per-connection 模型，每个客户端由独立子进程处理。
+ *   父进程的内存变量无法被子进程回写，因此用文件 CLIENT_SEQ_FILE 持久化序号。
+ *   通过 fcntl 写锁（F_SETLKW 阻塞等待）保证多个子进程并发调用时的原子性：
+ *     1) 加写锁
+ *     2) 读取当前序号
+ *     3) 写回 seq+1
+ *     4) 解锁
+ *   返回的是递增前的值，供 preferred_index_by_seq() 计算路由。
+ *   文件在 w26server 启动时被 unlink 清零，因此序号随服务重启归一。
+ */
+static long next_client_seq(void)
+{
+    int fd;
+    struct flock fl;
+    char buf[32];
+    long seq = 1;
+    ssize_t n;
+
+    fd = open(CLIENT_SEQ_FILE, O_RDWR | O_CREAT, 0644);
+    if (fd < 0)
+    {
+        return 1;
+    }
+
+    /* 加写锁，阻塞等待其他子进程释放 */
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    if (fcntl(fd, F_SETLKW, &fl) < 0)
+    {
+        close(fd);
+        return 1;
+    }
+
+    /* 读取当前序号 */
+    n = read(fd, buf, sizeof(buf) - 1);
+    if (n > 0)
+    {
+        buf[n] = '\0';
+        seq = strtol(buf, NULL, 10);
+        if (seq < 1)
+        {
+            seq = 1;
+        }
+    }
+
+    /* 写回 seq+1，供下一个客户端使用 */
+    lseek(fd, 0, SEEK_SET);
+    (void)ftruncate(fd, 0);
+    snprintf(buf, sizeof(buf), "%ld\n", seq + 1);
+    (void)write(fd, buf, strlen(buf));
+
+    /* 解锁并关闭 */
+    fl.l_type = F_UNLCK;
+    (void)fcntl(fd, F_SETLK, &fl);
+    close(fd);
+
+    return seq;
 }
 
 /* 功能：判断命令是否属于需分流的业务命令。实现原理：按协议关键字匹配 P1/P2 文件检索命令。 */
@@ -1323,11 +1396,13 @@ static int route_business_command(int client_fd, const char *cmd, int route_inde
     time_t mirror2_ts = (time_t)0;
     time_t now = time(NULL);
 
+    /* 非业务命令返回 -2，通知调用方走其他分支处理 */
     if (!is_business_command(cmd))
     {
         return -2;
     }
 
+    /* 根据心跳时间戳判断 mirror 在线状态，超过 TTL 则视为离线 */
     (void)load_heartbeat_status(&mirror1_ts, &mirror2_ts);
     nodes[1].online = (mirror1_ts > 0 && (now - mirror1_ts) <= HEARTBEAT_TTL_SEC) ? 1 : 0;
     nodes[2].online = (mirror2_ts > 0 && (now - mirror2_ts) <= HEARTBEAT_TTL_SEC) ? 1 : 0;
@@ -1337,16 +1412,19 @@ static int route_business_command(int client_fd, const char *cmd, int route_inde
         return send_all(client_fd, "No server available\n", 20);
     }
 
+    /* route_index==0: 该客户端归属主服，直接在本地执行业务逻辑 */
     if (route_index == 0)
     {
         return execute_local_business_command(client_fd, cmd);
     }
 
+    /* 目标 mirror 离线则报错（客户端 CONNECT_PROBE 阶段已做过在线检查，此处为二次保护） */
     if (!nodes[route_index].online)
     {
         return send_all(client_fd, "No server available\n", 20);
     }
 
+    /* 目标 mirror 在线: 返回 REDIRECT，客户端收到后会断开当前连接并重连到目标 mirror */
     {
         char redirect_line[64];
 
@@ -1381,7 +1459,45 @@ static int process_command(int client_fd, const char *cmd, int route_index)
 
     if (strcmp(cmd, "PING") == 0)
     {
-        return send_all(client_fd, "PONG w26server\n", 14);
+        return send_all(client_fd, "PONG w26server\n", 15);
+    }
+
+    /*
+     * CONNECT_PROBE：客户端连接后发送的第一条命令，用于确定实际服务节点。
+     * 处理逻辑：
+     *   1) 读取 mirror1/mirror2 的心跳时间戳，判断其在线状态
+     *   2) 如果 route_index==0（本地处理）或目标镜像离线 → 回复 CONNECTED（由主服务本地处理）
+     *   3) 如果目标镜像在线 → 回复 REDIRECT，客户端收到后断开当前连接并重连到目标镜像
+     * 这样确保客户端始终被路由到一个可用的节点。
+     */
+    if (strcmp(cmd, "CONNECT_PROBE") == 0)
+    {
+        route_node_t nodes[3] = {
+            {"w26server", "127.0.0.1", DEFAULT_PORT, 1},
+            {"mirror1", MIRROR1_HOST, MIRROR1_PORT, 0},
+            {"mirror2", MIRROR2_HOST, MIRROR2_PORT, 0}};
+        time_t m1_ts = (time_t)0;
+        time_t m2_ts = (time_t)0;
+        time_t now = time(NULL);
+        char line_buf[128];
+
+        (void)load_heartbeat_status(&m1_ts, &m2_ts);
+        nodes[1].online = (m1_ts > 0 && (now - m1_ts) <= HEARTBEAT_TTL_SEC) ? 1 : 0;
+        nodes[2].online = (m2_ts > 0 && (now - m2_ts) <= HEARTBEAT_TTL_SEC) ? 1 : 0;
+
+        if (route_index == 0 || !nodes[route_index].online)
+        {
+            snprintf(line_buf, sizeof(line_buf),
+                     "CONNECTED %s %s %d\n",
+                     nodes[0].name, nodes[0].host, nodes[0].port);
+        }
+        else
+        {
+            snprintf(line_buf, sizeof(line_buf),
+                     "REDIRECT %s %d\n",
+                     nodes[route_index].host, nodes[route_index].port);
+        }
+        return send_all(client_fd, line_buf, strlen(line_buf));
     }
 
     if (strcmp(cmd, "GET_NODES") == 0)
@@ -1391,16 +1507,6 @@ static int process_command(int client_fd, const char *cmd, int route_index)
             return send_all(client_fd, "NODES w26server=1 mirror1=0 mirror2=0\n", 38);
         }
         return send_all(client_fd, nodes_line, strlen(nodes_line));
-    }
-
-    if (strncmp(cmd, "HEARTBEAT ", 10) == 0)
-    {
-        const char *node_name = cmd + 10;
-        if (update_heartbeat(node_name) == 0)
-        {
-            return send_all(client_fd, "HB_OK\n", 6);
-        }
-        return send_all(client_fd, "HB_ERR\n", 7);
     }
 
     route_rc = route_business_command(client_fd, cmd, route_index);
@@ -1422,23 +1528,71 @@ static int process_command(int client_fd, const char *cmd, int route_index)
  * 功能：处理单个客户端会话生命周期。
  * 实现原理：在子进程内执行“读一行->分发->回包”的循环；收到 quitc 主动发送 BYE 后结束，
  * 或在读写错误/对端断开时退出，让父进程继续维持总服务可用性。
+ *
+ * 核心设计：
+ *   每个 TCP 连接由一个独立子进程处理。连接可能来自两种来源：
+ *   (a) mirror 的心跳上报 -- 发送 "HEARTBEAT mirrorN\n"，处理后立即结束，不消耗客户端序号
+ *   (b) 真正的客户端     -- 发送 "CONNECT_PROBE\n" 等命令，首次收到时原子分配序号并计算路由
+ *
+ *   route_index 初始为 -1，表示尚未分配。收到第一条非心跳命令时才调用
+ *   next_client_seq() 获取序号并通过 preferred_index_by_seq() 确定路由目标。
+ *   这种延迟分配机制确保 mirror 的心跳连接永远不会干扰客户端的序号计数。
+ *
+ *   会话终止条件：
+ *   - 对端关闭连接（recv 返回 0，即 Ctrl+C 或网络断开）
+ *   - 客户端发送 quitc 命令
+ *   - 命令处理出错
  */
-static void crequest(int client_fd, int route_index)
+static void crequest(int client_fd)
 {
     char cmd[MAX_COMMAND_LEN];
+    int route_index = -1;
 
     for (;;)
     {
-        /* 会话循环：持续读命令，直到断连或 quitc */
         int rc = read_command_line(client_fd, cmd, sizeof(cmd));
         if (rc <= 0)
         {
             break;
         }
 
+        /*
+         * 心跳识别：mirror 节点每 2 秒发一次 "HEARTBEAT mirrorN\n"。
+         * 这类连接是短生命周期的内部协议，处理完直接 break，
+         * 不走后续的序号分配逻辑，从而不影响客户端的路由计数。
+         */
+        if (strncmp(cmd, "HEARTBEAT ", 10) == 0)
+        {
+            const char *node_name = cmd + 10;
+            if (update_heartbeat(node_name) == 0)
+            {
+                (void)send_all(client_fd, "HB_OK\n", 6);
+            }
+            else
+            {
+                (void)send_all(client_fd, "HB_ERR\n", 7);
+            }
+            break;
+        }
+
+        /*
+         * 延迟序号分配：仅在收到第一条真实客户端命令时触发一次。
+         * next_client_seq() 通过文件锁保证原子递增。
+         * preferred_index_by_seq() 将序号映射为路由索引(0/1/2)。
+         */
+        if (route_index < 0)
+        {
+            long seq = next_client_seq();
+            route_index = preferred_index_by_seq(seq);
+            printf("%s client #%ld routed to %s\n",
+                   NODE_NAME, seq,
+                   (route_index == 0) ? "w26server" : (route_index == 1) ? "mirror1"
+                                                                         : "mirror2");
+            fflush(stdout);
+        }
+
         if (strcmp(cmd, "quitc") == 0)
         {
-            /* 客户端主动结束会话 */
             (void)send_all(client_fd, "BYE\n", 4);
             break;
         }
@@ -1458,7 +1612,6 @@ static void crequest(int client_fd, int route_index)
 static int run_server(const server_config_t *cfg)
 {
     int listen_fd = create_listen_socket(cfg);
-    unsigned long connection_seq = 1;
 
     if (listen_fd < 0)
     {
@@ -1473,7 +1626,6 @@ static int run_server(const server_config_t *cfg)
     {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
-        /* 主进程阻塞等待新连接 */
         int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
 
         if (client_fd < 0)
@@ -1486,12 +1638,6 @@ static int run_server(const server_config_t *cfg)
             continue;
         }
 
-        /* 连接序号在主进程中按 accept 顺序全局递增，子进程只继承结果值。 */
-        int route_index = preferred_index_by_seq((long)connection_seq);
-        unsigned long current_seq = connection_seq;
-        connection_seq++;
-
-        /* 每个客户端连接 fork 一个子进程独占处理 */
         pid_t pid = fork();
         if (pid < 0)
         {
@@ -1502,14 +1648,8 @@ static int run_server(const server_config_t *cfg)
 
         if (pid == 0)
         {
-            /* 子进程只负责当前连接，处理完即退出 */
             close(listen_fd);
-            printf("%s connection #%lu routed to %s\n",
-                   NODE_NAME,
-                   current_seq,
-                   (route_index == 0) ? "w26server" : (route_index == 1) ? "mirror1"
-                                                                         : "mirror2");
-            crequest(client_fd, route_index);
+            crequest(client_fd);
             close(client_fd);
             _exit(0);
         }
@@ -1530,14 +1670,15 @@ static int run_server(const server_config_t *cfg)
 int main(void)
 {
     server_config_t cfg;
-    /* TODO: 从命令行参数或配置文件读取监听地址与端口。 */
-    /* TODO: 增加日志级别、守护进程模式等运行参数。 */
     /* 默认监听所有网卡 */
     cfg.bind_host = "0.0.0.0";
     cfg.bind_port = DEFAULT_PORT;
 
     /* 初始化状态文件，避免首次 GET_NODES 读取失败。 */
     (void)save_heartbeat_status((time_t)0, (time_t)0);
+
+    /* 重置客户端序号计数器 */
+    (void)unlink(CLIENT_SEQ_FILE);
 
     printf("%s starting on port %d (skeleton)\n", NODE_NAME, cfg.bind_port);
     return run_server(&cfg);

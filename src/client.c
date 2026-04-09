@@ -285,6 +285,12 @@ static int receive_response(int server_fd, char *redirect_host, size_t redirect_
         *redirected = 0;
     }
 
+    /*
+     * 协议分支 1: REDIRECT
+     * 格式: "REDIRECT <host> <port>"
+     * 含义: w26server 告知客户端应重连到指定的 mirror 节点。
+     * 解析成功后设置 redirected=1 并返回，调用方据此断开当前连接并重连目标。
+     */
     if (redirect_host != NULL && redirect_host_size > 0 && redirect_port != NULL)
     {
         char redirect_fmt[32];
@@ -306,6 +312,12 @@ static int receive_response(int server_fd, char *redirect_host, size_t redirect_
         }
     }
 
+    /*
+     * 协议分支 2: FILE
+     * 格式: "FILE <size>"  后跟 size 字节的二进制 tar.gz 数据
+     * 含义: 服务端将匹配文件打包为归档并流式传输给客户端。
+     * 客户端按协议头中的字节数严格读取，写入 ~/project/temp.tar.gz。
+     */
     if (sscanf(line, "FILE %ld", &file_size) == 1 && file_size >= 0)
     {
         /* 约定：归档始终写入 ~/project/temp.tar.gz，便于老师与脚本统一检查。 */
@@ -389,8 +401,6 @@ int main(void)
     int session_fd;
     int current_port = PRIMARY_PORT;
 
-    /* TODO: 增加可配置服务端地址与端口（命令行参数或配置文件）。 */
-
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
@@ -404,9 +414,67 @@ int main(void)
         return 1;
     }
 
-    /* 连接成功即显示 */
-    printf("client connected to w26server (%s:%d)\n", PRIMARY_HOST, PRIMARY_PORT);
-    fflush(stdout);
+    /*
+     * 节点探测与路由跟随流程：
+     *   1) 向 w26server 发送 CONNECT_PROBE
+     *   2) w26server 根据客户端序号决定路由：
+     *      - 归属本地 → 回复 "CONNECTED w26server 127.0.0.1 5000"（非 REDIRECT，循环结束）
+     *      - 归属 mirror → 回复 "REDIRECT 127.0.0.1 5001"
+     *   3) 收到 REDIRECT 后断开当前连接，重连到目标 mirror，再发 CONNECT_PROBE
+     *   4) mirror 回复 "CONNECTED mirrorN ..."（非 REDIRECT，循环结束）
+     *   循环结束后 session_fd 已连接到最终服务节点，后续所有命令都直接发往该节点。
+     */
+    {
+        char probe_host[64] = {0};
+        int probe_port = 0;
+        int probe_redirected = 0;
+        int hops;
+
+        for (hops = 0; hops < MAX_REDIRECT_HOPS; ++hops)
+        {
+            if (send_command(session_fd, "CONNECT_PROBE") != 0 ||
+                receive_response(session_fd, probe_host, sizeof(probe_host),
+                                 &probe_port, &probe_redirected, 0) != 0)
+            {
+                fprintf(stderr, "client: CONNECT_PROBE failed\n");
+                close(session_fd);
+                return 1;
+            }
+
+            /* CONNECTED 响应(非 REDIRECT)表示当前节点即为最终服务节点 */
+            if (!probe_redirected)
+            {
+                break;
+            }
+
+            /* 收到 REDIRECT: 断开当前连接，重连到目标 mirror */
+            close(session_fd);
+            snprintf(current_host, sizeof(current_host), "%s", probe_host);
+            current_port = probe_port;
+
+            session_fd = connect_to_server(current_host, current_port);
+            if (session_fd < 0)
+            {
+                fprintf(stderr, "client: failed to connect %s:%d\n",
+                        current_host, current_port);
+                return 1;
+            }
+        }
+
+        if (hops >= MAX_REDIRECT_HOPS)
+        {
+            fprintf(stderr, "client: too many redirects during probe\n");
+            close(session_fd);
+            return 1;
+        }
+
+        printf("client connected to w26server (%s:%d), NODE: %s\n",
+               current_host, current_port,
+               (current_port == PRIMARY_PORT) ? "w26server"
+               : (current_port == MIRROR1_PORT) ? "mirror1"
+               : "mirror2");
+        fflush(stdout);
+    }
 
     /* 交互式命令循环：保持同一会话连接，直到 quitc 或异常 */
     while (fgets(line, sizeof(line), stdin) != NULL)
