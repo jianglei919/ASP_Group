@@ -14,30 +14,7 @@
 /* 客户端默认连接主服务端 */
 #define PRIMARY_HOST "127.0.0.1"
 #define PRIMARY_PORT 5000
-#define MIRROR1_HOST "127.0.0.1"
-#define MIRROR1_PORT 5001
-#define MIRROR2_HOST "127.0.0.1"
-#define MIRROR2_PORT 5002
 #define MAX_COMMAND_LEN 512
-#define NODES_CACHE_TTL_SEC 2
-
-typedef struct node_info
-{
-    /* 节点逻辑名，用于日志与状态识别。 */
-    const char *name;
-    /* 节点 IP/主机地址。 */
-    const char *host;
-    /* 节点服务端口。 */
-    int port;
-    /* 在线标记：1 在线，0 离线。 */
-    int online;
-} node_info_t;
-
-typedef struct nodes_cache
-{
-    /* 上次成功刷新在线表的时间戳。 */
-    time_t last_refresh_ts;
-} nodes_cache_t;
 
 /*
  * 功能：建立到服务端的 TCP 连接。
@@ -360,179 +337,20 @@ static int receive_response(int server_fd)
 }
 
 /*
- * 功能：按行接收一条文本响应。
- * 实现原理：逐字节读取直到换行，便于处理 GET_NODES 返回。
- */
-static int receive_line_only(int server_fd, char *buf, size_t size)
-{
-    size_t idx = 0;
-
-    if (buf == NULL || size == 0)
-    {
-        return -1;
-    }
-
-    while (idx + 1 < size)
-    {
-        char ch;
-        ssize_t n = recv(server_fd, &ch, 1, 0);
-        if (n < 0)
-        {
-            if (errno == EINTR)
-            {
-                continue;
-            }
-            return -1;
-        }
-        if (n == 0)
-        {
-            break;
-        }
-        if (ch == '\n')
-        {
-            break;
-        }
-        if (ch != '\r')
-        {
-            buf[idx++] = ch;
-        }
-    }
-
-    buf[idx] = '\0';
-    return (idx > 0) ? 0 : -1;
-}
-
-/*
- * 功能：解析在线表中的节点状态。
- * 实现原理：通过字符串匹配提取 w26server/mirror1/mirror2 的 0/1 标记。
- */
-static void apply_nodes_status(const char *line, node_info_t nodes[3])
-{
-    nodes[0].online = (strstr(line, "w26server=1") != NULL) ? 1 : 0;
-    nodes[1].online = (strstr(line, "mirror1=1") != NULL) ? 1 : 0;
-    nodes[2].online = (strstr(line, "mirror2=1") != NULL) ? 1 : 0;
-}
-
-/*
- * 功能：从主服务端获取节点在线表。
- * 实现原理：短连接发送 GET_NODES 并解析返回文本；失败时退化为仅主服务可用。
- */
-static void fetch_nodes_status(node_info_t nodes[3])
-{
-    int fd;
-    char line[128];
-
-    fd = connect_to_server(PRIMARY_HOST, PRIMARY_PORT);
-    if (fd < 0)
-    {
-        nodes[0].online = 1;
-        nodes[1].online = 0;
-        nodes[2].online = 0;
-        return;
-    }
-
-    if (send_command(fd, "GET_NODES") != 0 || receive_line_only(fd, line, sizeof(line)) != 0)
-    {
-        close(fd);
-        nodes[0].online = 1;
-        nodes[1].online = 0;
-        nodes[2].online = 0;
-        return;
-    }
-
-    close(fd);
-    apply_nodes_status(line, nodes);
-}
-
-/*
- * 功能：按缓存策略刷新在线表。
- * 实现原理：在 TTL 内直接复用缓存；超时或强制刷新时重新请求 GET_NODES。
- */
-static void refresh_nodes_status(node_info_t nodes[3], nodes_cache_t *cache, int force)
-{
-    time_t now;
-
-    if (cache == NULL)
-    {
-        fetch_nodes_status(nodes);
-        return;
-    }
-
-    now = time(NULL);
-    if (!force && cache->last_refresh_ts > 0 && (now - cache->last_refresh_ts) < NODES_CACHE_TTL_SEC)
-    {
-        return;
-    }
-
-    fetch_nodes_status(nodes);
-    cache->last_refresh_ts = now;
-}
-
-/*
- * 功能：根据题目连接序号规则计算优先节点。
- * 实现原理：1-2 主服、3-4 mirror1、5-6 mirror2，7 开始按 1-2-3 循环。
- */
-static int preferred_index_by_seq(long seq)
-{
-    if (seq <= 2)
-    {
-        return 0;
-    }
-    if (seq <= 4)
-    {
-        return 1;
-    }
-    if (seq <= 6)
-    {
-        return 2;
-    }
-    return (int)((seq - 7) % 3);
-}
-
-/*
- * 功能：按“优先节点 + 故障跳过”选择可用节点。
- * 实现原理：从优先下标开始顺序探测 3 个节点，返回第一个 online 节点。
- */
-static int choose_node_index(const node_info_t nodes[3], int preferred)
-{
-    int i;
-
-    for (i = 0; i < 3; ++i)
-    {
-        int idx = (preferred + i) % 3;
-        if (nodes[idx].online)
-        {
-            return idx;
-        }
-    }
-
-    return -1;
-}
-
-/*
  * 功能：客户端程序入口与交互主循环。
  * 实现原理：建立连接后循环执行 读取输入 -> 校验 -> 发送 -> 接收，直到 quitc。
  */
 int main(void)
 {
-    long request_seq = 1;
     char line[MAX_COMMAND_LEN];
     char err[128];
-    nodes_cache_t cache = {0};
-    node_info_t nodes[3] = {
-        {"w26server", PRIMARY_HOST, PRIMARY_PORT, 1},
-        {"mirror1", MIRROR1_HOST, MIRROR1_PORT, 0},
-        {"mirror2", MIRROR2_HOST, MIRROR2_PORT, 0}};
 
     /* TODO: 增加可配置服务端地址与端口（命令行参数或配置文件）。 */
 
     /* 交互式命令循环：读入、校验、发送、接收 */
     while (fgets(line, sizeof(line), stdin) != NULL)
     {
-        int preferred_idx;
-        int chosen_idx;
-        int attempt;
-        int sent_ok = 0;
+        int server_fd;
 
         /* 去掉输入末尾换行，统一使用 send_command 追加 '\n' */
         line[strcspn(line, "\n")] = '\0';
@@ -543,59 +361,22 @@ int main(void)
             continue;
         }
 
-        /* 优先使用缓存在线表，减少每条命令都访问主服务端的状态开销。 */
-        refresh_nodes_status(nodes, &cache, 0);
-        preferred_idx = preferred_index_by_seq(request_seq);
-        chosen_idx = choose_node_index(nodes, preferred_idx);
-
-        if (chosen_idx < 0)
+        /* 严格服务端分流：客户端固定连接主服务端，分流决策全部在主服务端完成。 */
+        server_fd = connect_to_server(PRIMARY_HOST, PRIMARY_PORT);
+        if (server_fd < 0)
         {
-            refresh_nodes_status(nodes, &cache, 1);
-            chosen_idx = choose_node_index(nodes, preferred_idx);
-            if (chosen_idx < 0)
-            {
-                fprintf(stderr, "client: no online server available\n");
-                break;
-            }
-        }
-
-        /* 以首选节点为起点轮询尝试，确保节点短暂故障时能自动旁路。 */
-        for (attempt = 0; attempt < 3; ++attempt)
-        {
-            int idx = (chosen_idx + attempt) % 3;
-            int server_fd;
-
-            if (!nodes[idx].online)
-            {
-                continue;
-            }
-
-            server_fd = connect_to_server(nodes[idx].host, nodes[idx].port);
-            if (server_fd < 0)
-            {
-                nodes[idx].online = 0;
-                continue;
-            }
-
-            if (send_command(server_fd, line) == 0 && receive_response(server_fd) == 0)
-            {
-                sent_ok = 1;
-                close(server_fd);
-                break;
-            }
-
-            close(server_fd);
-            nodes[idx].online = 0;
-        }
-
-        if (!sent_ok)
-        {
-            refresh_nodes_status(nodes, &cache, 1);
-            fprintf(stderr, "client: send/receive failed on all available nodes\n");
+            fprintf(stderr, "client: failed to connect primary server\n");
             break;
         }
 
-        request_seq++;
+        if (send_command(server_fd, line) != 0 || receive_response(server_fd) != 0)
+        {
+            fprintf(stderr, "client: send/receive failed with primary server\n");
+            close(server_fd);
+            break;
+        }
+
+        close(server_fd);
 
         if (strcmp(line, "quitc") == 0)
         {

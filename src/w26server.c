@@ -23,6 +23,10 @@
 #define STATUS_FILE "/tmp/w26_nodes_status.txt"
 #define HEARTBEAT_TTL_SEC 6
 #define DEFAULT_MAX_SCAN_DEPTH 8
+#define MIRROR1_HOST "127.0.0.1"
+#define MIRROR1_PORT 5001
+#define MIRROR2_HOST "127.0.0.1"
+#define MIRROR2_PORT 5002
 
 // 服务端配置结构体
 typedef struct server_config
@@ -65,6 +69,14 @@ typedef struct date_filter
     time_t threshold; // 日期阈值时间戳（本地时区）
     int before;       // 1 表示 fdb(早于阈值)，0 表示 fda(晚于等于阈值)。
 } date_filter_t;
+
+typedef struct route_node
+{
+    const char *name;
+    const char *host;
+    int port;
+    int online;
+} route_node_t;
 
 /*
  * 功能：可靠发送指定长度的数据。
@@ -1209,16 +1221,336 @@ static int read_command_line(int client_fd, char *buf, size_t size)
     return 1;
 }
 
+/* 功能：连接到指定后端节点。实现原理：创建 TCP 套接字并发起 connect，失败即关闭并返回错误。 */
+static int connect_to_backend(const char *host, int port)
+{
+    int sock_fd;
+    struct sockaddr_in addr;
+
+    sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock_fd < 0)
+    {
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)port);
+
+    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1)
+    {
+        close(sock_fd);
+        return -1;
+    }
+
+    if (connect(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        close(sock_fd);
+        return -1;
+    }
+
+    return sock_fd;
+}
+
+/* 功能：向后端发送一条命令行。实现原理：发送命令文本并追加换行，保持与前端协议一致。 */
+static int send_backend_command(int backend_fd, const char *cmd)
+{
+    if (cmd == NULL)
+    {
+        return -1;
+    }
+
+    if (send_all(backend_fd, cmd, strlen(cmd)) != 0)
+    {
+        return -1;
+    }
+    return send_all(backend_fd, "\n", 1);
+}
+
+/* 功能：从后端读取一行文本。实现原理：逐字节读取直到换行，兼容 CRLF。 */
+static int recv_backend_line(int backend_fd, char *buf, size_t size)
+{
+    size_t idx = 0;
+
+    if (buf == NULL || size == 0)
+    {
+        return -1;
+    }
+
+    while (idx + 1 < size)
+    {
+        char ch;
+        ssize_t n = recv(backend_fd, &ch, 1, 0);
+
+        if (n < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0)
+        {
+            break;
+        }
+        if (ch == '\n')
+        {
+            break;
+        }
+        if (ch != '\r')
+        {
+            buf[idx++] = ch;
+        }
+    }
+
+    buf[idx] = '\0';
+    return (idx > 0) ? 0 : -1;
+}
+
+/* 功能：按指定字节数中继后端二进制数据。实现原理：循环 recv->send，严格以协议大小为边界。 */
+static int relay_backend_bytes(int backend_fd, int client_fd, long size)
+{
+    char buf[4096];
+    long relayed = 0;
+
+    while (relayed < size)
+    {
+        size_t need = (size_t)((size - relayed) > (long)sizeof(buf) ? sizeof(buf) : (size_t)(size - relayed));
+        ssize_t n = recv(backend_fd, buf, need, 0);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0)
+        {
+            return -1;
+        }
+        if (send_all(client_fd, buf, (size_t)n) != 0)
+        {
+            return -1;
+        }
+        relayed += (long)n;
+    }
+
+    return 0;
+}
+
+/* 功能：转发后端单次响应给客户端。实现原理：先读首行；文本直接回传，FILE 响应按大小透传二进制体。 */
+static int forward_backend_response(int backend_fd, int client_fd)
+{
+    char line[MAX_COMMAND_LEN + 128];
+    long file_size;
+
+    if (recv_backend_line(backend_fd, line, sizeof(line)) != 0)
+    {
+        return -1;
+    }
+
+    if (sscanf(line, "FILE %ld", &file_size) == 1 && file_size >= 0)
+    {
+        char header[64];
+        if (snprintf(header, sizeof(header), "FILE %ld\n", file_size) < 0)
+        {
+            return -1;
+        }
+        if (send_all(client_fd, header, strlen(header)) != 0)
+        {
+            return -1;
+        }
+        return relay_backend_bytes(backend_fd, client_fd, file_size);
+    }
+
+    if (send_all(client_fd, line, strlen(line)) != 0)
+    {
+        return -1;
+    }
+    return send_all(client_fd, "\n", 1);
+}
+
+/* 功能：把业务命令代理到镜像节点。实现原理：短连接发送命令后读取单次响应并透传给客户端。 */
+static int proxy_business_command(int client_fd, const char *cmd, const route_node_t *node)
+{
+    int backend_fd;
+    int rc;
+
+    if (node == NULL || node->host == NULL)
+    {
+        return -1;
+    }
+
+    backend_fd = connect_to_backend(node->host, node->port);
+    if (backend_fd < 0)
+    {
+        return -1;
+    }
+
+    rc = send_backend_command(backend_fd, cmd);
+    if (rc == 0)
+    {
+        rc = forward_backend_response(backend_fd, client_fd);
+    }
+
+    close(backend_fd);
+    return rc;
+}
+
+/* 功能：按题目连接序号规则计算优先节点。实现原理：1-2 主服、3-4 mirror1、5-6 mirror2，7 起循环。 */
+static int preferred_index_by_seq(long seq)
+{
+    if (seq <= 2)
+    {
+        return 0;
+    }
+    if (seq <= 4)
+    {
+        return 1;
+    }
+    if (seq <= 6)
+    {
+        return 2;
+    }
+    return (int)((seq - 7) % 3);
+}
+
+/* 功能：判断命令是否属于需分流的业务命令。实现原理：按协议关键字匹配 P1/P2 文件检索命令。 */
+static int is_business_command(const char *cmd)
+{
+    char date_buf[32];
+
+    if (cmd == NULL)
+    {
+        return 0;
+    }
+
+    if (strcmp(cmd, "dirlist -a") == 0 || strcmp(cmd, "dirlist -t") == 0)
+    {
+        return 1;
+    }
+    if (strncmp(cmd, "fn ", 3) == 0 || strncmp(cmd, "fz ", 3) == 0 || strncmp(cmd, "ft ", 3) == 0)
+    {
+        return 1;
+    }
+    if (sscanf(cmd, "fdb %31s", date_buf) == 1 || sscanf(cmd, "fda %31s", date_buf) == 1)
+    {
+        return 1;
+    }
+
+    return 0;
+}
+
+/* 功能：在主服务本地执行业务命令。实现原理：复用现有处理函数，避免重复实现业务逻辑。 */
+static int execute_local_business_command(int client_fd, const char *cmd)
+{
+    char date_buf[32];
+
+    if (strcmp(cmd, "dirlist -a") == 0)
+    {
+        return handle_dirlist_a(client_fd);
+    }
+    if (strcmp(cmd, "dirlist -t") == 0)
+    {
+        return handle_dirlist_t(client_fd);
+    }
+    if (strncmp(cmd, "fn ", 3) == 0)
+    {
+        const char *filename = cmd + 3;
+        while (*filename == ' ')
+        {
+            filename++;
+        }
+        return handle_fn(client_fd, filename);
+    }
+    if (strncmp(cmd, "fz ", 3) == 0)
+    {
+        return handle_fz(client_fd, cmd);
+    }
+    if (strncmp(cmd, "ft ", 3) == 0)
+    {
+        return handle_ft(client_fd, cmd);
+    }
+    if (sscanf(cmd, "fdb %31s", date_buf) == 1)
+    {
+        return handle_fdx(client_fd, date_buf, 1);
+    }
+    if (sscanf(cmd, "fda %31s", date_buf) == 1)
+    {
+        return handle_fdx(client_fd, date_buf, 0);
+    }
+
+    return -1;
+}
+
+/*
+ * 功能：服务端分流
+ * 实现原理：主服务端根据在线状态与连接序号先选优先节点，失败则在在线节点中故障跳过重试。
+ */
+static int route_business_command(int client_fd, const char *cmd, unsigned long *route_seq)
+{
+    route_node_t nodes[3] = {
+        {"w26server", "127.0.0.1", DEFAULT_PORT, 1},
+        {"mirror1", MIRROR1_HOST, MIRROR1_PORT, 0},
+        {"mirror2", MIRROR2_HOST, MIRROR2_PORT, 0}};
+    time_t mirror1_ts = (time_t)0;
+    time_t mirror2_ts = (time_t)0;
+    time_t now = time(NULL);
+    int preferred;
+    int attempt;
+
+    if (!is_business_command(cmd))
+    {
+        return -2;
+    }
+
+    (void)load_heartbeat_status(&mirror1_ts, &mirror2_ts);
+    nodes[1].online = (mirror1_ts > 0 && (now - mirror1_ts) <= HEARTBEAT_TTL_SEC) ? 1 : 0;
+    nodes[2].online = (mirror2_ts > 0 && (now - mirror2_ts) <= HEARTBEAT_TTL_SEC) ? 1 : 0;
+
+    preferred = preferred_index_by_seq((long)(*route_seq));
+    (*route_seq)++;
+
+    for (attempt = 0; attempt < 3; ++attempt)
+    {
+        int idx = (preferred + attempt) % 3;
+        if (!nodes[idx].online)
+        {
+            continue;
+        }
+
+        if (idx == 0)
+        {
+            if (execute_local_business_command(client_fd, cmd) == 0)
+            {
+                return 0;
+            }
+            nodes[idx].online = 0;
+            continue;
+        }
+
+        if (proxy_business_command(client_fd, cmd, &nodes[idx]) == 0)
+        {
+            return 0;
+        }
+        nodes[idx].online = 0;
+    }
+
+    return send_all(client_fd, "No server available\n", 20);
+}
+
 /*
  * 功能：处理单条客户端命令并返回响应。
  * 实现原理：按命令优先级进行字符串分发：先处理控制协议（PING/GET_NODES/HEARTBEAT），
  * 再处理目录与文件检索命令；未匹配命令统一走 ACK 回退，便于调试与协议扩展。
  */
-static int process_command(int client_fd, const char *cmd)
+static int process_command(int client_fd, const char *cmd, unsigned long *route_seq)
 {
     char resp[MAX_COMMAND_LEN + 64];
     char nodes_line[128];
-    char date_buf[32];
+    int route_rc;
 
     if (cmd == NULL)
     {
@@ -1249,44 +1581,10 @@ static int process_command(int client_fd, const char *cmd)
         return send_all(client_fd, "HB_ERR\n", 7);
     }
 
-    if (strcmp(cmd, "dirlist -a") == 0)
+    route_rc = route_business_command(client_fd, cmd, route_seq);
+    if (route_rc != -2)
     {
-        return handle_dirlist_a(client_fd);
-    }
-
-    if (strcmp(cmd, "dirlist -t") == 0)
-    {
-        return handle_dirlist_t(client_fd);
-    }
-
-    if (strncmp(cmd, "fn ", 3) == 0)
-    {
-        const char *filename = cmd + 3;
-        while (*filename == ' ')
-        {
-            filename++;
-        }
-        return handle_fn(client_fd, filename);
-    }
-
-    if (strncmp(cmd, "fz ", 3) == 0)
-    {
-        return handle_fz(client_fd, cmd);
-    }
-
-    if (strncmp(cmd, "ft ", 3) == 0)
-    {
-        return handle_ft(client_fd, cmd);
-    }
-
-    if (sscanf(cmd, "fdb %31s", date_buf) == 1)
-    {
-        return handle_fdx(client_fd, date_buf, 1);
-    }
-
-    if (sscanf(cmd, "fda %31s", date_buf) == 1)
-    {
-        return handle_fdx(client_fd, date_buf, 0);
+        return route_rc;
     }
 
     /* 未识别命令返回 ACK，便于调试扩展命令分发。 */
@@ -1307,6 +1605,7 @@ static void crequest(int client_fd)
 {
     /* 每个客户端连接由一个子进程独占处理 */
     char cmd[MAX_COMMAND_LEN];
+    unsigned long route_seq = 1;
 
     for (;;)
     {
@@ -1324,7 +1623,7 @@ static void crequest(int client_fd)
             break;
         }
 
-        if (process_command(client_fd, cmd) != 0)
+        if (process_command(client_fd, cmd, &route_seq) != 0)
         {
             break;
         }
