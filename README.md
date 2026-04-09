@@ -1,46 +1,46 @@
-# ASP_Group — 分布式文件检索系统
+# ASP_Group — Distributed File Retrieval System
 
-## 1. 项目概述
+## 1. Project Overview
 
-基于 Socket 的分布式文件检索系统，采用 **1 主 + 2 镜像** 的三节点架构：
+A Socket-based distributed file retrieval system featuring a **1 Primary + 2 Mirror** three-node architecture:
 
-| 组件        | 端口 | 职责                                                   |
-| ----------- | ---- | ------------------------------------------------------ |
-| `w26server` | 5000 | 主服务端：接入入口、全局序号分配、自身序号段的业务处理 |
-| `mirror1`   | 5001 | 镜像节点 1：独立业务处理，通过心跳向主服上报在线状态   |
-| `mirror2`   | 5002 | 镜像节点 2：同 mirror1                                 |
-| `client`    | —    | 客户端：连接主服获取路由，跟随 REDIRECT 到目标节点     |
+| Component   | Port | Responsibility                                                        |
+| ----------- | ---- | --------------------------------------------------------------------- |
+| `w26server` | 5000 | Primary server: connection gateway, global sequence allocation, node operations |
+| `mirror1`   | 5001 | Mirror node 1: independent business processing, reports online status via heartbeat |
+| `mirror2`   | 5002 | Mirror node 2: same as mirror1                                        |
+| `client`    | —    | Client: connects to primary, follows REDIRECT to target node           |
 
-三个服务节点都具备**完整且对等的业务处理能力**（dirlist / fn / fz / ft / fdb / fda），不依赖主服代理转发。
+All three service nodes have **complete and equivalent business processing capabilities** (dirlist / fn / fz / ft / fdb / fda) and do not rely on primary server proxy forwarding.
 
-## 2. 系统架构
+## 2. System Architecture
 
 ```mermaid
 graph TB
-    subgraph clients ["客户端"]
+    subgraph clients ["Clients"]
         style clients fill:#E3F2FD,stroke:#1565C0,stroke-width:2px
         C1["client #1-2"]
         C2["client #3-4"]
         C3["client #5-6"]
-        C4["client #7+<br/>(循环轮转)"]
+        C4["client #7+<br/>(round-robin)"]
     end
 
-    subgraph cluster ["服务端集群"]
+    subgraph cluster ["Server Cluster"]
         style cluster fill:#FFF8E1,stroke:#F9A825,stroke-width:2px
-        W26["w26server<br/>:5000<br/>主服务端 + 业务节点"]
-        M1["mirror1<br/>:5001<br/>镜像业务节点"]
-        M2["mirror2<br/>:5002<br/>镜像业务节点"]
+        W26["w26server<br/>:5000<br/>Primary + Business Node"]
+        M1["mirror1<br/>:5001<br/>Mirror Business Node"]
+        M2["mirror2<br/>:5002<br/>Mirror Business Node"]
     end
 
     C1 -->|"CONNECT_PROBE → CONNECTED"| W26
     C2 -->|"CONNECT_PROBE → REDIRECT"| W26
-    C2 -.->|"重连"| M1
+    C2 -.->|"Reconnect"| M1
     C3 -->|"CONNECT_PROBE → REDIRECT"| W26
-    C3 -.->|"重连"| M2
-    C4 -->|"按序号轮转"| W26
+    C3 -.->|"Reconnect"| M2
+    C4 -->|"Round-robin by seq"| W26
 
-    M1 -->|"HEARTBEAT<br/>每2秒"| W26
-    M2 -->|"HEARTBEAT<br/>每2秒"| W26
+    M1 -->|"HEARTBEAT<br/>every 2s"| W26
+    M2 -->|"HEARTBEAT<br/>every 2s"| W26
 
     style W26 fill:#FFCC80,stroke:#E65100,stroke-width:2px,color:#000
     style M1 fill:#A5D6A7,stroke:#2E7D32,stroke-width:2px,color:#000
@@ -51,45 +51,45 @@ graph TB
     style C4 fill:#90CAF9,stroke:#1565C0,stroke-width:1px,color:#000
 ```
 
-## 3. 连接序号分配规则
+## 3. Client Sequence Number Allocation Rules
 
-客户端连接序号由 `w26server` 通过原子文件计数器 (`/tmp/w26_client_seq.txt`) 分配，**心跳连接不消耗序号**。
+Client connection sequence numbers are allocated by `w26server` through an atomic file counter (`/tmp/w26_client_seq.txt`). **Heartbeat connections do not consume sequence numbers**.
 
-| 序号             | 归属节点  | 说明                      |
-| ---------------- | --------- | ------------------------- |
-| 1-2              | w26server | 主服务端本地处理          |
-| 3-4              | mirror1   | 重定向到 mirror1          |
-| 5-6              | mirror2   | 重定向到 mirror2          |
-| 7, 10, 13, 16... | w26server | 循环轮转 (seq-7) % 3 == 0 |
-| 8, 11, 14, 17... | mirror1   | 循环轮转 (seq-7) % 3 == 1 |
-| 9, 12, 15, 18... | mirror2   | 循环轮转 (seq-7) % 3 == 2 |
+| Sequence Number    | Assigned Node | Description                      |
+| ------------------ | ------------- | -------------------------------- |
+| 1-2                | w26server    | Primary server local processing  |
+| 3-4                | mirror1      | Redirect to mirror1              |
+| 5-6                | mirror2      | Redirect to mirror2              |
+| 7, 10, 13, 16...   | w26server    | Round-robin (seq-7) % 3 == 0    |
+| 8, 11, 14, 17...   | mirror1      | Round-robin (seq-7) % 3 == 1    |
+| 9, 12, 15, 18...   | mirror2      | Round-robin (seq-7) % 3 == 2    |
 
-序号在 `w26server` 启动时清零，运行期间只增不减。
+Sequence numbers reset when `w26server` starts and only increment during runtime.
 
 ```mermaid
 flowchart TD
-    START(["新客户端连接"]) --> PROBE["发送 CONNECT_PROBE"]
-    PROBE --> SEQ["w26server 原子分配序号 seq"]
+    START(["New Client Connection"]) --> PROBE["Send CONNECT_PROBE"]
+    PROBE --> SEQ["w26server atomically allocates seq"]
     SEQ --> CHECK{seq <= 6 ?}
 
-    CHECK -->|"是"| FIXED{"seq 落在哪个区间?"}
+    CHECK -->|"Yes"| FIXED{"Which range?"}
     FIXED -->|"1-2"| R0["route_index = 0<br/>w26server"]
     FIXED -->|"3-4"| R1["route_index = 1<br/>mirror1"]
     FIXED -->|"5-6"| R2["route_index = 2<br/>mirror2"]
 
-    CHECK -->|"否 (seq >= 7)"| MOD["计算 (seq - 7) % 3"]
+    CHECK -->|"No (seq >= 7)"| MOD["Calculate (seq - 7) % 3"]
     MOD -->|"== 0"| R0
     MOD -->|"== 1"| R1
     MOD -->|"== 2"| R2
 
-    R0 --> LOCAL["回复 CONNECTED<br/>本地处理"]
-    R1 --> ONLINE1{"mirror1 在线?"}
-    R2 --> ONLINE2{"mirror2 在线?"}
+    R0 --> LOCAL["Reply CONNECTED<br/>Local processing"]
+    R1 --> ONLINE1{"mirror1 online?"}
+    R2 --> ONLINE2{"mirror2 online?"}
 
-    ONLINE1 -->|"是"| REDIR1["回复 REDIRECT<br/>→ mirror1:5001"]
-    ONLINE1 -->|"否"| LOCAL
-    ONLINE2 -->|"是"| REDIR2["回复 REDIRECT<br/>→ mirror2:5002"]
-    ONLINE2 -->|"否"| LOCAL
+    ONLINE1 -->|"Yes"| REDIR1["Reply REDIRECT<br/>→ mirror1:5001"]
+    ONLINE1 -->|"No"| LOCAL
+    ONLINE2 -->|"Yes"| REDIR2["Reply REDIRECT<br/>→ mirror2:5002"]
+    ONLINE2 -->|"No"| LOCAL
 
     style START fill:#E3F2FD,stroke:#1565C0,stroke-width:2px,color:#000
     style SEQ fill:#FFF9C4,stroke:#F9A825,stroke-width:2px,color:#000
@@ -107,9 +107,9 @@ flowchart TD
     style PROBE fill:#BBDEFB,stroke:#1565C0,stroke-width:1px,color:#000
 ```
 
-## 4. 客户端连接时序
+## 4. Client Connection Sequence
 
-### 4.1 归属 w26server（本地处理）
+### 4.1 Assigned to w26server (Local Processing)
 
 ```mermaid
 sequenceDiagram
@@ -118,12 +118,12 @@ sequenceDiagram
 
     C->>W: TCP connect (:5000)
     C->>W: CONNECT_PROBE
-    Note over W: 分配 seq=1, route_index=0<br/>归属本地
+    Note over W: Allocate seq=1, route_index=0<br/>Local assignment
     W-->>C: CONNECTED w26server 127.0.0.1 5000
-    Note over C: 显示 "NODE: w26server"
+    Note over C: Display "NODE: w26server"
 
     rect rgb(240, 248, 255)
-        Note over C,W: 业务会话
+        Note over C,W: Business session
         C->>W: dirlist -a
         W-->>C: dir1 dir2 dir3 ...
         C->>W: fn sample.txt
@@ -133,7 +133,7 @@ sequenceDiagram
     end
 ```
 
-### 4.2 归属 mirror（REDIRECT 重连）
+### 4.2 Assigned to Mirror (REDIRECT Reconnection)
 
 ```mermaid
 sequenceDiagram
@@ -143,25 +143,25 @@ sequenceDiagram
 
     C->>W: TCP connect (:5000)
     C->>W: CONNECT_PROBE
-    Note over W: 分配 seq=3, route_index=1<br/>归属 mirror1, 检查心跳在线
+    Note over W: Allocate seq=3, route_index=1<br/>Assign to mirror1, check heartbeat status
     W-->>C: REDIRECT 127.0.0.1 5001
-    Note over C: 断开与 w26server 的连接
+    Note over C: Disconnect from w26server
 
     C->>M: TCP connect (:5001)
     C->>M: CONNECT_PROBE
     M-->>C: CONNECTED mirror1 127.0.0.1 5001
-    Note over C: 显示 "NODE: mirror1"
+    Note over C: Display "NODE: mirror1"
 
     rect rgb(240, 255, 240)
-        Note over C,M: 业务会话（直接与 mirror1 通信）
+        Note over C,M: Business session (direct communication with mirror1)
         C->>M: fz 100 10000
-        M-->>C: FILE 2048 + [二进制tar.gz]
+        M-->>C: FILE 2048 + [binary tar.gz]
         C->>M: quitc
         M-->>C: BYE
     end
 ```
 
-### 4.3 心跳上报
+### 4.3 Heartbeat Reporting
 
 ```mermaid
 sequenceDiagram
@@ -169,30 +169,30 @@ sequenceDiagram
     participant W as 🟠 w26server
     participant M2 as 🟣 mirror2
 
-    loop 每 2 秒
+    loop Every 2 seconds
         M1->>W: TCP connect
         M1->>W: HEARTBEAT mirror1
-        Note over W: 更新 mirror1 时间戳<br/>（不消耗客户端序号）
+        Note over W: Update mirror1 timestamp<br/>(Does not consume client seq)
         W-->>M1: HB_OK
-        M1->>W: 断开连接
+        M1->>W: Disconnect
     end
 
-    loop 每 2 秒
+    loop Every 2 seconds
         M2->>W: TCP connect
         M2->>W: HEARTBEAT mirror2
-        Note over W: 更新 mirror2 时间戳
+        Note over W: Update mirror2 timestamp
         W-->>M2: HB_OK
-        M2->>W: 断开连接
+        M2->>W: Disconnect
     end
 
-    Note over W: GET_NODES 查询时<br/>心跳时间差 <= 6s → 在线<br/>心跳时间差 > 6s → 离线
+    Note over W: When GET_NODES queries:<br/>Heartbeat time diff <= 6s → online<br/>Heartbeat time diff > 6s → offline
 ```
 
-## 5. 通信协议
+## 5. Communication Protocol
 
 ```mermaid
 graph LR
-    subgraph control ["控制协议"]
+    subgraph control ["Control Protocol"]
         style control fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px
         CP["CONNECT_PROBE"] --> CONN["CONNECTED name host port"]
         CP --> REDIR["REDIRECT host port"]
@@ -202,11 +202,11 @@ graph LR
         QC["quitc"] --> BYE["BYE"]
     end
 
-    subgraph business ["业务协议"]
+    subgraph business ["Business Protocol"]
         style business fill:#E3F2FD,stroke:#1565C0,stroke-width:2px
-        DL["dirlist -a / -t"] --> TEXT["文本行响应"]
+        DL["dirlist -a / -t"] --> TEXT["Text line response"]
         FN["fn filename"] --> META["filename=... size=... created=... permissions=..."]
-        FZ["fz size1 size2"] --> FILE["FILE size + 二进制tar.gz"]
+        FZ["fz size1 size2"] --> FILE["FILE size + binary tar.gz"]
         FT["ft ext1 ..."] --> FILE
         FDB["fdb YYYY-MM-DD"] --> FILE
         FDA["fda YYYY-MM-DD"] --> FILE
@@ -225,33 +225,33 @@ graph LR
     style FDA fill:#90CAF9,stroke:#1565C0,color:#000
 ```
 
-## 6. w26server 子进程处理流程
+## 6. w26server Child Process Flow
 
-`w26server` 采用 `fork-per-connection` 并发模型。每个 TCP 连接由一个独立子进程处理，子进程通过读取第一条命令来区分心跳连接与客户端连接：
+`w26server` uses a `fork-per-connection` concurrency model. Each TCP connection is handled by an independent child process, which distinguishes heartbeat connections from client connections by reading the first command:
 
 ```mermaid
 flowchart TD
-    ACCEPT(["accept() 新连接"]) --> FORK["fork() 子进程"]
-    FORK --> READ["读取第一条命令"]
+    ACCEPT(["accept() New Connection"]) --> FORK["fork() Child Process"]
+    FORK --> READ["Read First Command"]
 
-    READ --> IS_HB{"以 HEARTBEAT 开头?"}
+    READ --> IS_HB{"Starts with HEARTBEAT?"}
 
-    IS_HB -->|"是"| HB_PROC["更新心跳时间戳<br/>回复 HB_OK"]
-    HB_PROC --> EXIT1(["子进程退出<br/>❌ 不消耗序号"])
+    IS_HB -->|"Yes"| HB_PROC["Update Heartbeat Timestamp<br/>Reply HB_OK"]
+    HB_PROC --> EXIT1(["Child Process Exit<br/>❌ No seq consumed"])
 
-    IS_HB -->|"否"| ALLOC["调用 next_client_seq()<br/>原子分配序号"]
-    ALLOC --> ROUTE["preferred_index_by_seq()<br/>计算 route_index"]
-    ROUTE --> CMD_LOOP{"命令循环"}
+    IS_HB -->|"No"| ALLOC["Call next_client_seq()<br/>Atomically allocate seq"]
+    ALLOC --> ROUTE["preferred_index_by_seq()<br/>Calculate route_index"]
+    ROUTE --> CMD_LOOP{"Command Loop"}
 
     CMD_LOOP -->|"CONNECT_PROBE"| DECIDE{"route_index == 0?"}
-    DECIDE -->|"本地"| CONNECTED["回复 CONNECTED"]
-    DECIDE -->|"mirror"| CHECK_ONLINE{"mirror 在线?"}
-    CHECK_ONLINE -->|"是"| REDIRECT["回复 REDIRECT"]
-    CHECK_ONLINE -->|"否"| CONNECTED
+    DECIDE -->|"Local"| CONNECTED["Reply CONNECTED"]
+    DECIDE -->|"Mirror"| CHECK_ONLINE{"Mirror Online?"}
+    CHECK_ONLINE -->|"Yes"| REDIRECT["Reply REDIRECT"]
+    CHECK_ONLINE -->|"No"| CONNECTED
 
-    CMD_LOOP -->|"业务命令"| BIZ["execute_local 或 REDIRECT"]
-    CMD_LOOP -->|"quitc"| BYE_RESP["回复 BYE"]
-    CMD_LOOP -->|"连接断开"| EXIT2(["子进程退出"])
+    CMD_LOOP -->|"Business Command"| BIZ["execute_local or REDIRECT"]
+    CMD_LOOP -->|"quitc"| BYE_RESP["Reply BYE"]
+    CMD_LOOP -->|"Connection Closed"| EXIT2(["Child Process Exit"])
     BYE_RESP --> EXIT2
 
     CONNECTED --> CMD_LOOP
@@ -269,121 +269,121 @@ flowchart TD
     style EXIT2 fill:#FFCDD2,stroke:#C62828,stroke-width:1px,color:#000
 ```
 
-## 7. 项目结构
+## 7. Project Structure
 
 ```text
 ASP_Group/
 ├── src/
-│   ├── w26server.c          # 主服务端（接入分流 + 业务处理）
-│   ├── mirror1.c            # 镜像节点 1（心跳 + 业务处理）
-│   ├── mirror2.c            # 镜像节点 2（心跳 + 业务处理）
-│   └── client.c             # 客户端（CONNECT_PROBE + 命令交互）
+│   ├── w26server.c          # Primary server (connection routing + business processing)
+│   ├── mirror1.c            # Mirror node 1 (heartbeat + business processing)
+│   ├── mirror2.c            # Mirror node 2 (heartbeat + business processing)
+│   └── client.c             # Client (CONNECT_PROBE + command interaction)
 ├── scripts/
-│   ├── start_all_servers.sh  # 一键启动三个服务端（支持 --root / --depth）
-│   ├── stop_all_servers.sh   # 一键停止
-│   ├── server_status.sh      # 查看运行状态
-│   ├── run_w26server.sh      # 单独启动 w26server
-│   ├── run_mirror1.sh        # 单独启动 mirror1
-│   ├── run_mirror2.sh        # 单独启动 mirror2
-│   └── run_client.sh         # 启动客户端
+│   ├── start_all_servers.sh  # One-command startup for all three servers (supports --root / --depth)
+│   ├── stop_all_servers.sh   # One-command shutdown
+│   ├── server_status.sh      # Check runtime status
+│   ├── run_w26server.sh      # Start w26server individually
+│   ├── run_mirror1.sh        # Start mirror1 individually
+│   ├── run_mirror2.sh        # Start mirror2 individually
+│   └── run_client.sh         # Start client
 ├── doc/
-│   ├── Project_W26.pdf       # 项目需求文档
+│   ├── Project_W26.pdf       # Project requirement document
 │   ├── Requirement_Summary.md
 │   └── Requirement_Summary_zh.md
 ├── Makefile
 ├── .gitignore
-├── logs/                     # 服务端日志输出
-├── .pids/                    # 服务端 PID 文件
-└── out/                      # 编译产物
+├── logs/                     # Server log outputs
+├── .pids/                    # Server PID files
+└── out/                      # Build artifacts
 ```
 
-## 8. 编译
+## 8. Build
 
 ```bash
 make clean && make
 ```
 
-编译产物输出到 `out/` 目录。
+Build artifacts are output to the `out/` directory.
 
-## 9. 运行
+## 9. Running
 
-### 一键启动
+### One-Command Startup
 
 ```bash
 ./scripts/start_all_servers.sh --depth 6
 ```
 
-可选参数：
+Optional parameters:
 
-- `--root <path>`：指定文件搜索根目录（覆盖 `W26_SEARCH_ROOT`）
-- `--depth <1-64>`：限制递归扫描深度（覆盖 `W26_MAX_SCAN_DEPTH`）
+- `--root <path>`: Specify file search root directory (overrides `W26_SEARCH_ROOT`)
+- `--depth <1-64>`: Limit recursive scan depth (overrides `W26_MAX_SCAN_DEPTH`)
 
-### 启动客户端
+### Start Client
 
 ```bash
 ./out/client
 
-#一键启动脚本
+# One-command startup script
 ./scripts/run_client.sh
 ```
 
-连接后自动显示归属节点：
+After connection, the assigned node is automatically displayed:
 
 ```text
 client connected to w26server (127.0.0.1:5001), NODE: mirror1
 ```
 
-### 查看状态 / 停止
+### Check Status / Shutdown
 
 ```bash
-./scripts/server_status.sh       # 查看进程状态
-./scripts/stop_all_servers.sh    # 停止所有服务端
+./scripts/server_status.sh       # Check process status
+./scripts/stop_all_servers.sh    # Stop all servers
 ```
 
-## 10. 支持的命令
+## 10. Supported Commands
 
-| 命令                      | 说明                                        | 响应类型               |
-| ------------------------- | ------------------------------------------- | ---------------------- |
-| `dirlist -a`              | 按名称排序列出子目录                        | 文本行                 |
-| `dirlist -t`              | 按时间排序列出子目录                        | 文本行                 |
-| `fn <filename>`           | 查找文件并返回元数据（名称/大小/时间/权限） | 文本行                 |
-| `fz <size1> <size2>`      | 按文件大小范围筛选，打包回传                | `FILE <size>` + 二进制 |
-| `ft <ext1> [ext2] [ext3]` | 按扩展名筛选，打包回传（最多 3 个）         | `FILE <size>` + 二进制 |
-| `fdb <YYYY-MM-DD>`        | 筛选**早于**指定日期的文件，打包回传        | `FILE <size>` + 二进制 |
-| `fda <YYYY-MM-DD>`        | 筛选**晚于等于**指定日期的文件，打包回传    | `FILE <size>` + 二进制 |
-| `quitc`                   | 断开连接                                    | `BYE`                  |
+| Command                    | Description                                               | Response Type                |
+| -------------------------- | --------------------------------------------------------- | ---------------------------- |
+| `dirlist -a`               | List subdirectories sorted by name                         | Text lines                   |
+| `dirlist -t`               | List subdirectories sorted by time                         | Text lines                   |
+| `fn <filename>`            | Find file and return metadata (name/size/time/permissions) | Text line                    |
+| `fz <size1> <size2>`       | Filter by file size range, pack and return                 | `FILE <size>` + binary       |
+| `ft <ext1> [ext2] [ext3]`  | Filter by extension, pack and return (max 3)              | `FILE <size>` + binary       |
+| `fdb <YYYY-MM-DD>`         | Filter **before** specified date, pack and return          | `FILE <size>` + binary       |
+| `fda <YYYY-MM-DD>`         | Filter **on or after** specified date, pack and return     | `FILE <size>` + binary       |
+| `quitc`                    | Disconnect                                                 | `BYE`                        |
 
-压缩包文件保存到客户端的 `~/project/temp.tar.gz`。
+Archive files are saved to client's `~/project/temp.tar.gz`.
 
-查看压缩包命令：`tar -tzvf ~/project/temp.tar.gz`
+View archive contents: `tar -tzvf ~/project/temp.tar.gz`
 
-## 11. 环境变量
+## 11. Environment Variables
 
-| 变量                 | 默认值  | 说明                     |
-| -------------------- | ------- | ------------------------ |
-| `W26_SEARCH_ROOT`    | `$HOME` | 文件搜索根目录           |
-| `W26_MAX_SCAN_DEPTH` | `8`     | 递归扫描最大深度（1-64） |
+| Variable             | Default | Description                  |
+| -------------------- | ------- | ---------------------------- |
+| `W26_SEARCH_ROOT`    | `$HOME` | File search root directory   |
+| `W26_MAX_SCAN_DEPTH` | `8`     | Max recursive scan depth (1-64) |
 
-在大目录下执行文件检索时，建议限制搜索范围以避免耗时过长：
+When performing file retrieval in large directories, it's recommended to limit the search scope to avoid long processing times:
 
 ```bash
 ./scripts/start_all_servers.sh --root ~/workspace --depth 4
 ```
 
-## 12. 关键实现细节
+## 12. Key Implementation Details
 
-### 序号原子性
+### Sequence Number Atomicity
 
-`w26server` 采用 `fork-per-connection` 模型，父进程的内存变量无法被子进程回写。因此客户端序号通过 `/tmp/w26_client_seq.txt` 文件持久化，使用 `fcntl` 文件锁保证跨子进程的原子递增。
+`w26server` uses a `fork-per-connection` model where parent process memory variables cannot be written back by child processes. Therefore, client sequence numbers are persisted through `/tmp/w26_client_seq.txt` file, with `fcntl` file locking to ensure atomic increment across child processes.
 
-### 心跳与序号隔离
+### Heartbeat and Sequence Number Isolation
 
-mirror 节点每 2 秒向 w26server 发送一次 HEARTBEAT 短连接。`crequest()` 通过读取第一条命令来区分心跳和客户端——心跳连接处理后立即退出，**永远不会触发 `next_client_seq()`**，从而不干扰客户端的序号分配。
+Mirror nodes send HEARTBEAT short connections to `w26server` every 2 seconds. The connection handler distinguishes heartbeat from client connections by reading the first command — heartbeat connections exit immediately after processing and **never trigger `next_client_seq()`**, thus not interfering with client sequence number allocation.
 
-### 进程回收
+### Process Cleanup
 
-主进程通过 `signal(SIGCHLD, SIG_IGN)` 忽略子进程退出信号，由内核自动回收僵尸进程，避免 `waitpid` 阻塞主循环。
+The main process ignores child process exit signals via `signal(SIGCHLD, SIG_IGN)`, allowing the kernel to automatically reap zombie processes and avoiding `waitpid` blocking the main loop.
 
-### stale PID 自动清理
+### Stale PID Auto-cleanup
 
-`start_all_servers.sh` 在启动前检测 `.pids/` 下的 PID 文件：如果对应进程仍在运行则报错，如果进程已死则自动清理残留 PID 文件后正常启动。
+`start_all_servers.sh` checks PID files in `.pids/` before startup: if the corresponding process is still running, it reports an error; if the process is dead, it auto-cleans the stale PID file and proceeds with normal startup.
