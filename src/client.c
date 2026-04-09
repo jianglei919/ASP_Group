@@ -386,7 +386,8 @@ int main(void)
     char line[MAX_COMMAND_LEN];
     char err[128];
     char current_host[64];
-    int startup_fd;
+    int session_fd;
+    int current_port = PRIMARY_PORT;
 
     /* TODO: 增加可配置服务端地址与端口（命令行参数或配置文件）。 */
 
@@ -396,8 +397,8 @@ int main(void)
     snprintf(current_host, sizeof(current_host), "%s", PRIMARY_HOST);
 
     /* 启动时连接主服务端 */
-    startup_fd = connect_to_server(PRIMARY_HOST, PRIMARY_PORT);
-    if (startup_fd < 0)
+    session_fd = connect_to_server(PRIMARY_HOST, PRIMARY_PORT);
+    if (session_fd < 0)
     {
         fprintf(stderr, "client: failed to connect w26server (%s:%d)\n", PRIMARY_HOST, PRIMARY_PORT);
         return 1;
@@ -406,19 +407,15 @@ int main(void)
     /* 连接成功即显示 */
     printf("client connected to w26server (%s:%d)\n", PRIMARY_HOST, PRIMARY_PORT);
     fflush(stdout);
-    close(startup_fd);
 
-    /* 交互式命令循环：读入、校验、发送、接收 */
+    /* 交互式命令循环：保持同一会话连接，直到 quitc 或异常 */
     while (fgets(line, sizeof(line), stdin) != NULL)
     {
-        int server_fd = -1;
-        int final_server_fd = -1;
+        int redirect_hops;
+        int done = 0;
 
         /* 去掉输入末尾换行，统一使用 send_command 追加 '\n' */
         line[strcspn(line, "\n")] = '\0';
-
-        /* 每条新命令都从主服务端重新起步。 */
-        snprintf(current_host, sizeof(current_host), "%s", PRIMARY_HOST);
 
         if (validate_command(line, err, sizeof(err)) != 0)
         {
@@ -426,43 +423,38 @@ int main(void)
             continue;
         }
 
-        /* 严格服务端分流：先连主服务端，再按 REDIRECT 重连目标节点。 */
-        int current_port = PRIMARY_PORT;
-        int redirect_hops;
-        int done = 0;
-
         for (redirect_hops = 0; redirect_hops < MAX_REDIRECT_HOPS; ++redirect_hops)
         {
             char next_host[64] = {0};
             int next_port = 0;
             int redirected = 0;
 
-            server_fd = connect_to_server(current_host, current_port);
-            if (server_fd < 0)
-            {
-                fprintf(stderr, "client: failed to connect %s:%d\n", current_host, current_port);
-                break;
-            }
-
-            if (send_command(server_fd, line) != 0 ||
-                receive_response(server_fd, next_host, sizeof(next_host), &next_port, &redirected, 1) != 0)
+            if (send_command(session_fd, line) != 0 ||
+                receive_response(session_fd, next_host, sizeof(next_host), &next_port, &redirected, 1) != 0)
             {
                 fprintf(stderr, "client: send/receive failed with %s:%d\n", current_host, current_port);
-                close(server_fd);
+                close(session_fd);
+                session_fd = -1;
                 break;
             }
 
             if (!redirected)
             {
                 done = 1;
-                final_server_fd = server_fd;
                 break;
             }
 
-            close(server_fd);
+            close(session_fd);
 
             snprintf(current_host, sizeof(current_host), "%s", next_host);
             current_port = next_port;
+
+            session_fd = connect_to_server(current_host, current_port);
+            if (session_fd < 0)
+            {
+                fprintf(stderr, "client: failed to connect redirected target %s:%d\n", current_host, current_port);
+                break;
+            }
         }
 
         if (!done)
@@ -474,24 +466,16 @@ int main(void)
             break;
         }
 
-        /* quitc 不需要 PING 验证，服务端已经响应 BYE，直接退出 */
         if (strcmp(line, "quitc") == 0)
         {
-            close(final_server_fd);
             break;
         }
-
-        if (send_command(final_server_fd, "PING") != 0 || receive_response(final_server_fd, NULL, 0, NULL, NULL, 0) != 0)
-        {
-            fprintf(stderr, "client: failed to probe connected server %s:%d\n", current_host, current_port);
-            if (final_server_fd >= 0)
-            {
-                close(final_server_fd);
-            }
-            break;
-        }
-
-        close(final_server_fd);
     }
+
+    if (session_fd >= 0)
+    {
+        close(session_fd);
+    }
+
     return 0;
 }
