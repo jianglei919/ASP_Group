@@ -1164,7 +1164,8 @@ static int read_command_line(int client_fd, char *buf, size_t size)
 
 /*
  * 功能：处理单条客户端命令并返回响应。
- * 实现原理：按优先级顺序匹配协议命令，先处理控制与轻量命令，再进入检索归档命令；未匹配命令走 ACK 回退。
+ * 实现原理：mirror2 作为最终设计中的真实业务节点，直接在本地完成控制命令、目录检索和归档命令处理；
+ * 未匹配命令走 ACK 回退，便于保留调试与扩展空间。
  */
 static int process_command(int client_fd, const char *cmd)
 {
@@ -1219,10 +1220,7 @@ static int process_command(int client_fd, const char *cmd)
         return -1;
     }
 
-    /* TODO: 在此实现真实命令分发（dirlist/fn/fz/ft/fdb/fda）。 */
-    /* TODO: 根据命令结果返回规范消息，如 File not found / No file found。 */
-    /* TODO: 对打包类命令返回 temp.tar.gz（二进制传输）。 */
-    /* P0 阶段返回占位 ACK，后续在此接入真实命令处理 */
+    /* 未匹配命令返回 ACK，保留调试与扩展入口。 */
     if (snprintf(resp, sizeof(resp), "ACK from %s: %s\n", NODE_NAME, cmd) < 0)
     {
         return -1;
@@ -1233,11 +1231,12 @@ static int process_command(int client_fd, const char *cmd)
 
 /*
  * 功能：处理单个客户端会话生命周期。
- * 实现原理：子进程中执行“读一行->分发->回包”循环，quitc 主动回 BYE；异常或断连即结束会话。
+ * 实现原理：每个连接由子进程独占服务，循环执行“读一行->本地分发->回包”；quitc 主动回 BYE，
+ * 异常或断连即结束会话，连接内不再做二次路由。
  */
 static void crequest(int client_fd)
 {
-    /* 每个客户端连接由一个子进程独占处理 */
+    /* 每个客户端连接由一个子进程独占处理。 */
     char cmd[MAX_COMMAND_LEN];
 
     for (;;)
@@ -1265,7 +1264,8 @@ static void crequest(int client_fd)
 
 /*
  * 功能：启动服务端主循环并并发处理客户端。
- * 实现原理：父进程长期 accept，新连接即 fork 子进程独立处理，父进程关闭客户端 fd 后继续监听，实现进程级并发。
+ * 实现原理：父进程长期 accept，新连接按该节点的职责直接 fork 子进程独立处理；父进程关闭已复制的
+ * 客户端 fd 后继续监听，实现进程级并发与连接级固定归属。
  */
 static int run_server(const server_config_t *cfg)
 {
@@ -1323,15 +1323,16 @@ static int run_server(const server_config_t *cfg)
 }
 
 /*
- * 功能：程序入口，初始化配置并启动镜像服务端2。
- * 实现原理：配置监听参数并启动心跳线程，然后进入 run_server 监听循环，使上报与服务并行运行。
+ * 功能：程序入口，初始化配置并启动 mirror2 服务端。
+ * 实现原理：mirror2 先启动心跳线程向主服上报在线状态，再进入监听循环，作为最终设计中的实际业务节点
+ * 直接处理其归属连接。
  */
 int main(void)
 {
     server_config_t cfg;
     /* TODO: 从命令行参数或配置文件读取监听地址与端口。 */
     /* TODO: 增加日志级别、守护进程模式等运行参数。 */
-    /* 骨架默认监听所有网卡 */
+    /* 默认监听所有网卡。 */
     cfg.bind_host = "0.0.0.0";
     cfg.bind_port = DEFAULT_PORT;
 
