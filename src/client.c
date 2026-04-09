@@ -234,8 +234,9 @@ static int send_command(int server_fd, const char *line)
  * 功能：接收并打印服务端响应。
  * 实现原理：先读取首行判断是否是 REDIRECT 或 FILE 协议；若是 REDIRECT，则把目标地址回传给调用方，
  * 由上层重新连接目标节点并重发同一条命令。若是 FILE，则继续按长度读取二进制归档；否则直接打印文本响应。
+ * print_output：是否打印响应（用于内部 PING 验证不显示响应）
  */
-static int receive_response(int server_fd, char *redirect_host, size_t redirect_host_size, int *redirect_port, int *redirected)
+static int receive_response(int server_fd, char *redirect_host, size_t redirect_host_size, int *redirect_port, int *redirected, int print_output)
 {
     char line[MAX_COMMAND_LEN + 128];
     const char *home;
@@ -362,11 +363,17 @@ static int receive_response(int server_fd, char *redirect_host, size_t redirect_
         }
 
         fclose(fp);
-        printf("Received temp.tar.gz (%ld bytes) -> %s\n", file_size, out_path);
+        if (print_output)
+        {
+            printf("Received temp.tar.gz (%ld bytes) -> %s\n", file_size, out_path);
+        }
         return 0;
     }
 
-    printf("%s\n", line);
+    if (print_output)
+    {
+        printf("%s\n", line);
+    }
     return 0;
 }
 
@@ -388,6 +395,7 @@ int main(void)
 
     snprintf(current_host, sizeof(current_host), "%s", PRIMARY_HOST);
 
+    /* 启动时连接主服务端 */
     startup_fd = connect_to_server(PRIMARY_HOST, PRIMARY_PORT);
     if (startup_fd < 0)
     {
@@ -395,6 +403,7 @@ int main(void)
         return 1;
     }
 
+    /* 连接成功即显示 */
     printf("client connected to w26server (%s:%d)\n", PRIMARY_HOST, PRIMARY_PORT);
     fflush(stdout);
     close(startup_fd);
@@ -436,7 +445,7 @@ int main(void)
             }
 
             if (send_command(server_fd, line) != 0 ||
-                receive_response(server_fd, next_host, sizeof(next_host), &next_port, &redirected) != 0)
+                receive_response(server_fd, next_host, sizeof(next_host), &next_port, &redirected, 1) != 0)
             {
                 fprintf(stderr, "client: send/receive failed with %s:%d\n", current_host, current_port);
                 close(server_fd);
@@ -465,7 +474,14 @@ int main(void)
             break;
         }
 
-        if (send_command(final_server_fd, "PING") != 0 || receive_response(final_server_fd, NULL, 0, NULL, NULL) != 0)
+        /* quitc 不需要 PING 验证，服务端已经响应 BYE，直接退出 */
+        if (strcmp(line, "quitc") == 0)
+        {
+            close(final_server_fd);
+            break;
+        }
+
+        if (send_command(final_server_fd, "PING") != 0 || receive_response(final_server_fd, NULL, 0, NULL, NULL, 0) != 0)
         {
             fprintf(stderr, "client: failed to probe connected server %s:%d\n", current_host, current_port);
             if (final_server_fd >= 0)
@@ -476,12 +492,6 @@ int main(void)
         }
 
         close(final_server_fd);
-
-        if (strcmp(line, "quitc") == 0)
-        {
-            /* quitc 的响应已接收，结束客户端循环 */
-            break;
-        }
     }
     return 0;
 }
