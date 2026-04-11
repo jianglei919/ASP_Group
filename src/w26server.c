@@ -1267,10 +1267,6 @@ static int process_command(int client_fd, const char *cmd, int route_index) {
         return -1;
     }
 
-    if (strcmp(cmd, "PING") == 0) {
-        return send_all(client_fd, "PONG w26server\n", 15);
-    }
-
     /*
      * CONNECT_PROBE: First command sent by the client to determine actual serving node.
      * Execution flow:
@@ -1405,7 +1401,7 @@ static int run_server(const server_config_t *cfg) {
     int listen_fd = create_listen_socket(cfg);
     // If the listen_fd is less than 0, then return 1
     if (listen_fd < 0) {
-        fprintf(stderr, "%s: failed to create listen socket (skeleton)\n", NODE_NAME);
+        fprintf(stderr, "%s: failed to create listen socket\n", NODE_NAME);
         return 1;
     }
 

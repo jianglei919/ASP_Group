@@ -209,7 +209,7 @@ static int send_command(int server_fd, const char *line) {
  * Principle: Read the first line to distinguish REDIRECT or FILE protocol; if REDIRECT,
  * pass the target address back to the caller to reconnect and resend the command.
  * If FILE, keep reading binary archive based on length; otherwise print text response.
- * print_output: whether to print a response (used for internal PING validation without output)
+ * print_output: whether to print text responses and FILE receive messages
  */
 static int receive_response(int server_fd, char *redirect_host, size_t redirect_host_size, int *redirect_port,
                             int *redirected, int print_output) {

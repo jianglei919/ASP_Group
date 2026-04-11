@@ -1027,9 +1027,6 @@ static int read_command_line(int client_fd, char *buf, size_t size) {
 static int process_command(int client_fd, const char *cmd) {
     char resp[MAX_COMMAND_LEN + 64];
     char date_buf[32];
-    if (strcmp(cmd, "PING") == 0) {
-        return send_all(client_fd, "PONG mirror1\n", 13);
-    }
 
     /*
      * CONNECT_PROBE: Probe command sent by client after getting REDIRECT from w26server to this node.
@@ -1123,7 +1120,7 @@ static void crequest(int client_fd) {
 static int run_server(const server_config_t *cfg) {
     int listen_fd = create_listen_socket(cfg);
     if (listen_fd < 0) {
-        fprintf(stderr, "%s: failed to create listen socket (skeleton)\n", NODE_NAME);
+        fprintf(stderr, "%s: failed to create listen socket\n", NODE_NAME);
         return 1;
     }
 
@@ -1143,6 +1140,9 @@ static int run_server(const server_config_t *cfg) {
             perror("accept");
             continue;
         }
+
+        printf("%s: client connected\n", NODE_NAME);
+        fflush(stdout);
 
         /* Fork a child process to exclusively handle each client connection */
         pid_t pid = fork();
@@ -1181,6 +1181,6 @@ int main(void) {
 
     start_heartbeat_thread();
 
-    printf("%s starting on port %d (skeleton)\n", NODE_NAME, cfg.bind_port);
+    printf("%s starting on port %d\n", NODE_NAME, cfg.bind_port);
     return run_server(&cfg);
 }
