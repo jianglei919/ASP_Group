@@ -16,7 +16,7 @@
 #include <sys/wait.h>
 #include <time.h>
 
-/* 镜像服务端2基础配置 */
+/* Mirror server 2 basic configuration */
 #define NODE_NAME "mirror2"
 #define DEFAULT_PORT 5002
 #define PRIMARY_HOST "127.0.0.1"
@@ -26,115 +26,96 @@
 #define MAX_COMMAND_LEN 512
 #define DEFAULT_MAX_SCAN_DEPTH 8
 
-// 服务端配置结构体
-typedef struct server_config
-{
-    const char *bind_host; // 监听地址，通常使用 0.0.0.0 绑定所有网卡
-    int bind_port;         // 监听端口，客户端与镜像节点都通过该端口访问主服务
+// Server configuration structure
+typedef struct server_config {
+    const char *bind_host; // Bind address, usually 0.0.0.0 to bind all interfaces
+    int bind_port; // Bind port, used by clients and mirrors to access primary service
 } server_config_t;
 
-// 目录项结构体
-typedef struct dir_item
-{
-    char *name;   // 目录名（不含父路径），用于输出 dirlist 结果
-    time_t ctime; // 目录时间戳，用于 dirlist -t 排序
+// Directory item structure
+typedef struct dir_item {
+    char *name; // Directory name (without parent path), for dirlist output
+    time_t ctime; // Directory timestamp, for dirlist -t sorting
 } dir_item_t;
 
-// 文件列表结构体
-typedef struct file_list
-{
-    char **paths; // 动态路径数组，每个元素是命中文件的绝对路径
-    size_t count; // 当前命中文件数量
+// File list structure
+typedef struct file_list {
+    char **paths; // Dynamic path array, each element is absolute path of matched file
+    size_t count; // Current number of matched files
 } file_list_t;
 
-// 大小过滤器结构体
-typedef struct size_filter
-{
-    off_t min_size; // 文件大小下界（含）
-    off_t max_size; // 文件大小上界（含）
+// Size filter structure
+typedef struct size_filter {
+    off_t min_size; // Minimum file size (inclusive)
+    off_t max_size; // Maximum file size (inclusive)
 } size_filter_t;
 
-// 扩展名过滤器结构体
-typedef struct ext_filter
-{
-    const char *exts[3]; // 允许的扩展名集合，最多 3 个
-    int count;           // 有效扩展名个数。
+// Extension filter structure
+typedef struct ext_filter {
+    const char *exts[3]; // Allowed extensions set, max 3
+    int count; // Number of valid extensions
 } ext_filter_t;
 
-// 日期过滤器结构体
-typedef struct date_filter
-{
-    time_t threshold; // 日期阈值时间戳（本地时区）
-    int before;       // 1 表示 fdb(早于阈值)，0 表示 fda(晚于等于阈值)。
+// Date filter structure
+typedef struct date_filter {
+    time_t threshold; // Date threshold timestamp (local timezone)
+    int before; // 1 for fdb (before), 0 for fda (after or equal)
 } date_filter_t;
 
 /*
- * 功能：可靠发送指定长度的数据。
- * 实现原理：TCP 发送存在短写风险，因此维护 sent 偏移循环发送直到写满目标长度；
- * send 被信号打断时按 EINTR 重试，返回 0 或不可恢复错误则视为连接异常并向上返回失败。
+ * Function: Reliably send data of specified length.
+ * Principle: TCP send has short-write risk, so maintain sent offset and loop until target length is written;
+ * Retry on EINTR if interrupted, return failure on 0 or unrecoverable error as connection exception.
  */
-static int send_all(int fd, const char *data, size_t len)
-{
-    /* 循环发送，避免一次 send 未发完导致数据丢失 */
+static int send_all(int fd, const char *data, size_t len) {
+    /* Loop to send, avoid data loss caused by incomplete send */
     size_t sent = 0;
 
-    while (sent < len)
-    {
+    while (sent < len) {
         ssize_t n = send(fd, data + sent, len - sent, 0);
-        if (n < 0)
-        {
-            if (errno == EINTR)
-            {
+        if (n < 0) {
+            if (errno == EINTR) {
                 continue;
             }
             return -1;
         }
-        if (n == 0)
-        {
+        if (n == 0) {
             return -1;
         }
-        sent += (size_t)n;
+        sent += (size_t) n;
     }
 
     return 0;
 }
 
 /*
- * 功能：按行接收文本响应。
- * 实现原理：逐字节读取直到 '\n'，并过滤 CRLF 中的 '\r'，保证输出是标准 C 字符串。
- * 该函数专门用于短文本协议（如心跳应答），避免一次 recv 粘包导致解析歧义。
+ * Function: Receive text response line by line.
+ * Principle: Read byte by byte until '\n', filter '\r' in CRLF, ensure output is standard C string.
+ * Used for short text protocol (like heartbeat reply) to avoid parsing ambiguity from recv packet joining.
  */
-static int recv_line(int fd, char *buf, size_t size)
-{
+static int recv_line(int fd, char *buf, size_t size) {
     size_t idx = 0;
 
-    if (buf == NULL || size == 0)
-    {
+    if (buf == NULL || size == 0) {
         return -1;
     }
 
-    while (idx + 1 < size)
-    {
+    while (idx + 1 < size) {
         char ch;
         ssize_t n = recv(fd, &ch, 1, 0);
-        if (n < 0)
-        {
-            if (errno == EINTR)
-            {
+        if (n < 0) {
+            if (errno == EINTR) {
                 continue;
             }
             return -1;
         }
-        if (n == 0)
-        {
+        if (n == 0) {
             break;
         }
-        if (ch == '\n')
-        {
+        if (ch == '\n') {
             break;
         }
-        if (ch != '\r')
-        {
+        if (ch != '\r') {
             buf[idx++] = ch;
         }
     }
@@ -144,64 +125,57 @@ static int recv_line(int fd, char *buf, size_t size)
 }
 
 /*
- * 功能：向主服务端发送一次心跳。
- * 实现原理：每次心跳建立短连接，发送固定格式 HEARTBEAT 消息并读取单行应答后立即关闭。
- * 这种无状态上报模型可避免长连接故障积累，异常时由下一周期重试恢复。
+ * Function: Send a heartbeat to the primary server.
+ * Principle: Create short connection per heartbeat, send fixed HEARTBEAT message, read reply and close immediately.
+ * This stateless reporting model avoids long connection failure accumulation, recovered by next cycle on error.
  */
-static int send_heartbeat_once(void)
-{
+static int send_heartbeat_once(void) {
     int fd;
     struct sockaddr_in addr;
     char line[64];
 
     fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0)
-    {
+    if (fd < 0) {
         return -1;
     }
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((unsigned short)PRIMARY_PORT);
-    if (inet_pton(AF_INET, PRIMARY_HOST, &addr.sin_addr) != 1)
-    {
+    if (inet_pton(AF_INET, PRIMARY_HOST, &addr.sin_addr) != 1) {
         close(fd);
         return -1;
     }
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-    {
+    if (connect(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
         close(fd);
         return -1;
     }
 
     /*
-     * 发送 "HEARTBEAT mirror2\n"，w26server 的 crequest() 会识别 HEARTBEAT 前缀，
-     * 更新状态文件中 mirror2 的时间戳并回复 HB_OK，不消耗客户端连接序号。
+     * Send "HEARTBEAT mirror2\n", w26server crequest() will recognize HEARTBEAT prefix,
+     * update timestamp for mirror2 in state file and reply HB_OK, without consuming client connection sequence.
      */
-    if (send_all(fd, "HEARTBEAT mirror2\n", 18) != 0)
-    {
+    if (send_all(fd, "HEARTBEAT mirror2\n", 18) != 0) {
         close(fd);
         return -1;
     }
 
-    (void)recv_line(fd, line, sizeof(line));
+    (void) recv_line(fd, line, sizeof(line));
     close(fd);
     return 0;
 }
 
 /*
- * 功能：后台线程周期发送心跳。
- * 实现原理：在线程内执行无限循环：上报一次心跳后 sleep 固定周期。
- * 即使某次上报失败也不会终止线程，从而保持持续自愈的在线状态上报能力。
+ * Function: Background thread periodically sends heartbeat.
+ * Principle: Infinite loop in thread: send heartbeat and sleep for fixed interval.
+ * Single failure won't terminate thread, maintaining continuous self-healing online reporting capability.
  */
-static void *heartbeat_thread_main(void *arg)
-{
-    (void)arg;
+static void *heartbeat_thread_main(void *arg) {
+    (void) arg;
 
-    for (;;)
-    {
-        (void)send_heartbeat_once();
+    for (;;) {
+        (void) send_heartbeat_once();
         sleep(HEARTBEAT_INTERVAL_SEC);
     }
 
@@ -209,22 +183,19 @@ static void *heartbeat_thread_main(void *arg)
 }
 
 /*
- * 功能：启动心跳线程。
- * 实现原理：创建后台线程并立即 detach，使其生命周期独立于主线程 join；
- * 主线程可无阻塞进入监听循环，心跳与服务并发执行。
+ * Function: Start heartbeat thread.
+ * Principle: Create background thread and detach immediately, making its lifecycle independent of main thread join;
+ * Main thread can unblock and enter listen loop, running heartbeat and service concurrently.
  */
-static void start_heartbeat_thread(void)
-{
+static void start_heartbeat_thread(void) {
     pthread_t tid;
-    if (pthread_create(&tid, NULL, heartbeat_thread_main, NULL) == 0)
-    {
-        (void)pthread_detach(tid);
+    if (pthread_create(&tid, NULL, heartbeat_thread_main, NULL) == 0) {
+        (void) pthread_detach(tid);
     }
 }
 
-/* 功能：将文件权限位转换为 rwx 字符串。实现原理：按 owner/group/other 顺序逐位映射，生成固定 9 字符权限串。 */
-static void format_permissions(mode_t mode, char out[10])
-{
+/* Function: Convert file permission bits to rwx string. Principle: Bitwise mapping by owner/group/other, generating fixed 9-char permission string. */
+static void format_permissions(mode_t mode, char out[10]) {
     out[0] = (mode & S_IRUSR) ? 'r' : '-';
     out[1] = (mode & S_IWUSR) ? 'w' : '-';
     out[2] = (mode & S_IXUSR) ? 'x' : '-';
@@ -237,89 +208,76 @@ static void format_permissions(mode_t mode, char out[10])
     out[9] = '\0';
 }
 
-/* 功能：目录名升序比较器。实现原理：作为 qsort 回调按字典序比较 name 字段，供 dirlist -a 复用。 */
-static int cmp_dir_by_name(const void *a, const void *b)
-{
-    const dir_item_t *da = (const dir_item_t *)a;
-    const dir_item_t *db = (const dir_item_t *)b;
+/* Function: Directory name ascending comparator. Principle: qsort callback comparing name field lexicographically, reused for dirlist -a. */
+static int cmp_dir_by_name(const void *a, const void *b) {
+    const dir_item_t *da = (const dir_item_t *) a;
+    const dir_item_t *db = (const dir_item_t *) b;
     return strcmp(da->name, db->name);
 }
 
-/* 功能：目录时间升序比较器。实现原理：先按 ctime 排序实现最老优先，若时间相同则按名称比较保证结果稳定。 */
-static int cmp_dir_by_ctime(const void *a, const void *b)
-{
-    const dir_item_t *da = (const dir_item_t *)a;
-    const dir_item_t *db = (const dir_item_t *)b;
+/* Function: Directory time ascending comparator. Principle: Sort by ctime for oldest-first, fallback to name comparison if time equals to ensure stability. */
+static int cmp_dir_by_ctime(const void *a, const void *b) {
+    const dir_item_t *da = (const dir_item_t *) a;
+    const dir_item_t *db = (const dir_item_t *) b;
 
-    if (da->ctime < db->ctime)
-    {
+    if (da->ctime < db->ctime) {
         return -1;
     }
-    if (da->ctime > db->ctime)
-    {
+    if (da->ctime > db->ctime) {
         return 1;
     }
     return strcmp(da->name, db->name);
 }
 
-/* 功能：复制字符串。实现原理：显式 malloc+memcpy 生成独立副本，避免对非标准函数 strdup 的可移植性依赖。 */
-static char *dup_string(const char *s)
-{
+/* Function: Duplicate string. Principle: Explicit malloc+memcpy for independent copy, avoiding portability issues with non-standard strdup. */
+static char *dup_string(const char *s) {
     size_t len;
     char *p;
 
-    if (s == NULL)
-    {
+    if (s == NULL) {
         return NULL;
     }
 
     len = strlen(s);
-    p = (char *)malloc(len + 1);
-    if (p == NULL)
-    {
+    p = (char *) malloc(len + 1);
+    if (p == NULL) {
         return NULL;
     }
     memcpy(p, s, len + 1);
     return p;
 }
 
-/* 功能：返回搜索根目录。实现原理：优先使用 W26_SEARCH_ROOT，未设置时回退 HOME，再回退当前目录。 */
-static const char *get_search_root(void)
-{
+/* Function: Get search root directory. Principle: Prefer W26_SEARCH_ROOT, fallback to HOME, then current directory. */
+static const char *get_search_root(void) {
     const char *custom = getenv("W26_SEARCH_ROOT");
     const char *home = getenv("HOME");
 
-    if (custom != NULL && custom[0] != '\0')
-    {
+    if (custom != NULL && custom[0] != '\0') {
         return custom;
     }
     return (home != NULL && home[0] != '\0') ? home : ".";
 }
 
-/* 功能：返回递归扫描最大深度。实现原理：读取 W26_MAX_SCAN_DEPTH 并进行数字与边界校验，非法值统一回落默认深度。 */
-static int get_max_scan_depth(void)
-{
+/* Function: Get max recursive scan depth. Principle: Read W26_MAX_SCAN_DEPTH with validation, fallback invalid values to default depth. */
+static int get_max_scan_depth(void) {
     const char *s = getenv("W26_MAX_SCAN_DEPTH");
     char *end = NULL;
     long v;
 
-    if (s == NULL || s[0] == '\0')
-    {
+    if (s == NULL || s[0] == '\0') {
         return DEFAULT_MAX_SCAN_DEPTH;
     }
 
     v = strtol(s, &end, 10);
-    if (end == s || *end != '\0' || v < 1 || v > 64)
-    {
+    if (end == s || *end != '\0' || v < 1 || v > 64) {
         return DEFAULT_MAX_SCAN_DEPTH;
     }
 
-    return (int)v;
+    return (int) v;
 }
 
-/* 功能：收集搜索根下一级子目录。实现原理：遍历根目录，仅提取目录项并记录目录名与时间戳，供后续排序输出。 */
-static int collect_subdirs(dir_item_t **out_items, size_t *out_count)
-{
+/* Function: Collect immediate subdirectories of search root. Principle: Traverse root, extract only directory items with name and timestamp for sorting output. */
+static int collect_subdirs(dir_item_t **out_items, size_t *out_count) {
     const char *root = get_search_root();
     DIR *dir;
     struct dirent *ent;
@@ -327,8 +285,7 @@ static int collect_subdirs(dir_item_t **out_items, size_t *out_count)
     size_t count = 0;
     int ok = 0;
 
-    if (out_items == NULL || out_count == NULL)
-    {
+    if (out_items == NULL || out_count == NULL) {
         return -1;
     }
 
@@ -336,56 +293,47 @@ static int collect_subdirs(dir_item_t **out_items, size_t *out_count)
     *out_count = 0;
 
     dir = opendir(root);
-    if (dir == NULL)
-    {
+    if (dir == NULL) {
         return -1;
     }
 
-    while ((ent = readdir(dir)) != NULL)
-    {
+    while ((ent = readdir(dir)) != NULL) {
         char full[PATH_MAX];
         struct stat st;
         char *name_copy;
         dir_item_t *tmp;
 
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
-        {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
             continue;
         }
-        if (snprintf(full, sizeof(full), "%s/%s", root, ent->d_name) < 0)
-        {
+        if (snprintf(full, sizeof(full), "%s/%s", root, ent->d_name) < 0) {
             continue;
         }
-        if (stat(full, &st) != 0 || !S_ISDIR(st.st_mode))
-        {
+        if (stat(full, &st) != 0 || !S_ISDIR(st.st_mode)) {
             continue;
         }
 
         name_copy = dup_string(ent->d_name);
-        if (name_copy == NULL)
-        {
+        if (name_copy == NULL) {
             ok = -1;
             break;
         }
-        tmp = (dir_item_t *)realloc(items, (count + 1) * sizeof(dir_item_t));
-        if (tmp == NULL)
-        {
+        tmp = (dir_item_t *) realloc(items, (count + 1) * sizeof(dir_item_t));
+        if (tmp == NULL) {
             free(name_copy);
             ok = -1;
             break;
         }
         items = tmp;
         items[count].name = name_copy;
-        items[count].ctime = st.st_ctime;
+        items[count].ctime = st.st_mtime;
         count++;
     }
     closedir(dir);
 
-    if (ok != 0)
-    {
+    if (ok != 0) {
         size_t i;
-        for (i = 0; i < count; ++i)
-        {
+        for (i = 0; i < count; ++i) {
             free(items[i].name);
         }
         free(items);
@@ -397,26 +345,20 @@ static int collect_subdirs(dir_item_t **out_items, size_t *out_count)
     return 0;
 }
 
-/* 功能：以单行文本返回目录列表。实现原理：按既定顺序将目录名以空格拼接并追加换行，便于客户端按行读取。 */
-static int send_dirlist_line(int client_fd, dir_item_t *items, size_t count)
-{
+/* Function: Return directory list as single text line. Principle: Concatenate names with spaces and append newline in order, for client to read by line. */
+static int send_dirlist_line(int client_fd, dir_item_t *items, size_t count) {
     size_t i;
 
-    if (count == 0)
-    {
+    if (count == 0) {
         return send_all(client_fd, "No directory found\n", 19);
     }
 
-    for (i = 0; i < count; ++i)
-    {
-        if (send_all(client_fd, items[i].name, strlen(items[i].name)) != 0)
-        {
+    for (i = 0; i < count; ++i) {
+        if (send_all(client_fd, items[i].name, strlen(items[i].name)) != 0) {
             return -1;
         }
-        if (i + 1 < count)
-        {
-            if (send_all(client_fd, " ", 1) != 0)
-            {
+        if (i + 1 < count) {
+            if (send_all(client_fd, " ", 1) != 0) {
                 return -1;
             }
         }
@@ -425,26 +367,22 @@ static int send_dirlist_line(int client_fd, dir_item_t *items, size_t count)
     return send_all(client_fd, "\n", 1);
 }
 
-/* 功能：释放目录集合内存。实现原理：先释放每个 name，再释放承载数组，避免多次请求造成内存累积。 */
-static void free_dir_items(dir_item_t *items, size_t count)
-{
+/* Function: Free directory item collection memory. Principle: Free each name first, then array, avoiding memory leaks on repeated requests. */
+static void free_dir_items(dir_item_t *items, size_t count) {
     size_t i;
-    for (i = 0; i < count; ++i)
-    {
+    for (i = 0; i < count; ++i) {
         free(items[i].name);
     }
     free(items);
 }
 
-/* 功能：处理 dirlist -a。实现原理：执行“收集->按名称排序->序列化发送->释放”的完整流程。 */
-static int handle_dirlist_a(int client_fd)
-{
+/* Function: Handle dirlist -a. Principle: Full pipeline of collect -> sort by name -> serialize send -> free. */
+static int handle_dirlist_a(int client_fd) {
     dir_item_t *items = NULL;
     size_t count = 0;
     int rc;
 
-    if (collect_subdirs(&items, &count) != 0)
-    {
+    if (collect_subdirs(&items, &count) != 0) {
         return send_all(client_fd, "No directory found\n", 19);
     }
 
@@ -454,15 +392,13 @@ static int handle_dirlist_a(int client_fd)
     return rc;
 }
 
-/* 功能：处理 dirlist -t。实现原理：执行“收集->按时间排序->序列化发送->释放”的完整流程。 */
-static int handle_dirlist_t(int client_fd)
-{
+/* Function: Handle dirlist -t. Principle: Full pipeline of collect -> sort by time -> serialize send -> free. */
+static int handle_dirlist_t(int client_fd) {
     dir_item_t *items = NULL;
     size_t count = 0;
     int rc;
 
-    if (collect_subdirs(&items, &count) != 0)
-    {
+    if (collect_subdirs(&items, &count) != 0) {
         return send_all(client_fd, "No directory found\n", 19);
     }
 
@@ -472,48 +408,37 @@ static int handle_dirlist_t(int client_fd)
     return rc;
 }
 
-/* 功能：递归查找首个同名文件。实现原理：对目录树做 DFS，命中即逐层返回，减少无意义遍历开销。 */
-static int find_first_file(const char *dir_path, const char *target_name, char *out_path, size_t out_size)
-{
+/* Function: Recursively find first file by name. Principle: DFS on directory tree, return immediately on hit, reducing meaningless traversal overhead. */
+static int find_first_file(const char *dir_path, const char *target_name, char *out_path, size_t out_size) {
     DIR *dir = opendir(dir_path);
     struct dirent *ent;
 
-    if (dir == NULL)
-    {
+    if (dir == NULL) {
         return 0;
     }
 
-    while ((ent = readdir(dir)) != NULL)
-    {
+    while ((ent = readdir(dir)) != NULL) {
         char full[PATH_MAX];
         struct stat st;
 
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
-        {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
             continue;
         }
 
-        if (snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name) < 0)
-        {
+        if (snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name) < 0) {
             continue;
         }
-        if (stat(full, &st) != 0)
-        {
+        if (stat(full, &st) != 0) {
             continue;
         }
 
-        if (S_ISDIR(st.st_mode))
-        {
-            if (find_first_file(full, target_name, out_path, out_size))
-            {
+        if (S_ISDIR(st.st_mode)) {
+            if (find_first_file(full, target_name, out_path, out_size)) {
                 closedir(dir);
                 return 1;
             }
-        }
-        else if (S_ISREG(st.st_mode) && strcmp(ent->d_name, target_name) == 0)
-        {
-            if (snprintf(out_path, out_size, "%s", full) >= 0)
-            {
+        } else if (S_ISREG(st.st_mode) && strcmp(ent->d_name, target_name) == 0) {
+            if (snprintf(out_path, out_size, "%s", full) >= 0) {
                 closedir(dir);
                 return 1;
             }
@@ -524,9 +449,8 @@ static int find_first_file(const char *dir_path, const char *target_name, char *
     return 0;
 }
 
-/* 功能：处理 fn filename。实现原理：先定位首个命中文件，再读取 stat 元数据并格式化为单行协议文本返回。 */
-static int handle_fn(int client_fd, const char *filename)
-{
+/* Function: Handle fn filename. Principle: Locate first matched file, read stat metadata, format as single line protocol text and return. */
+static int handle_fn(int client_fd, const char *filename) {
     const char *root = get_search_root();
     char path[PATH_MAX];
     struct stat st;
@@ -536,56 +460,47 @@ static int handle_fn(int client_fd, const char *filename)
     char resp[1024];
     const char *base;
 
-    if (filename == NULL || filename[0] == '\0')
-    {
+    if (filename == NULL || filename[0] == '\0') {
         return send_all(client_fd, "File not found\n", 15);
     }
-    if (!find_first_file(root, filename, path, sizeof(path)) || stat(path, &st) != 0)
-    {
+    if (!find_first_file(root, filename, path, sizeof(path)) || stat(path, &st) != 0) {
         return send_all(client_fd, "File not found\n", 15);
     }
 
     format_permissions(st.st_mode, perm);
     tm_info = localtime(&st.st_ctime);
-    if (tm_info == NULL)
-    {
+    if (tm_info == NULL) {
         snprintf(time_buf, sizeof(time_buf), "unknown");
-    }
-    else
-    {
-        (void)strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+    } else {
+        (void) strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
     }
 
     base = strrchr(path, '/');
     base = (base != NULL) ? (base + 1) : path;
-    if (snprintf(resp, sizeof(resp), "filename=%s size=%ld created=%s permissions=%s\n", base, (long)st.st_size, time_buf, perm) < 0)
-    {
+    if (snprintf(resp, sizeof(resp), "filename=%s size=%ld created=%s permissions=%s\n", base, (long)st.st_size,
+                 time_buf, perm) < 0) {
         return -1;
     }
 
     return send_all(client_fd, resp, strlen(resp));
 }
 
-/* 功能：向文件列表追加一条路径。实现原理：先复制路径字符串，再通过 realloc 扩容数组并追加到尾部。 */
-static int file_list_add(file_list_t *list, const char *path)
-{
+/* Function: Append path to file list. Principle: Duplicate string, realloc array and append to end. */
+static int file_list_add(file_list_t *list, const char *path) {
     char **tmp;
     char *copy;
 
-    if (list == NULL || path == NULL)
-    {
+    if (list == NULL || path == NULL) {
         return -1;
     }
 
     copy = dup_string(path);
-    if (copy == NULL)
-    {
+    if (copy == NULL) {
         return -1;
     }
 
-    tmp = (char **)realloc(list->paths, (list->count + 1) * sizeof(char *));
-    if (tmp == NULL)
-    {
+    tmp = (char **) realloc(list->paths, (list->count + 1) * sizeof(char *));
+    if (tmp == NULL) {
         free(copy);
         return -1;
     }
@@ -595,18 +510,15 @@ static int file_list_add(file_list_t *list, const char *path)
     return 0;
 }
 
-/* 功能：释放文件列表。实现原理：与构建顺序相反逐项释放，确保错误路径也能完整回收内存。 */
-static void free_file_list(file_list_t *list)
-{
+/* Function: Free file list. Principle: Release items in reverse order of construction, ensuring full memory recovery even on error paths. */
+static void free_file_list(file_list_t *list) {
     size_t i;
 
-    if (list == NULL)
-    {
+    if (list == NULL) {
         return;
     }
 
-    for (i = 0; i < list->count; ++i)
-    {
+    for (i = 0; i < list->count; ++i) {
         free(list->paths[i]);
     }
     free(list->paths);
@@ -614,123 +526,102 @@ static void free_file_list(file_list_t *list)
     list->count = 0;
 }
 
-/* 功能：判断文件是否匹配大小区间。实现原理：按闭区间比较 st_size，作为 fz 命令过滤回调统一复用。 */
-static int match_size_filter(const char *path, const struct stat *st, void *ctx)
-{
-    const size_filter_t *f = (const size_filter_t *)ctx;
-    (void)path;
+/* Function: Check if file matches size range. Principle: Inclusive comparison on st_size, reused as filter callback for fz command. */
+static int match_size_filter(const char *path, const struct stat *st, void *ctx) {
+    const size_filter_t *f = (const size_filter_t *) ctx;
+    (void) path;
 
-    if (st == NULL || f == NULL)
-    {
+    if (st == NULL || f == NULL) {
         return 0;
     }
     return (st->st_size >= f->min_size && st->st_size <= f->max_size) ? 1 : 0;
 }
 
-/* 功能：判断文件是否匹配扩展名集合。实现原理：提取 basename 的最后扩展名并与过滤列表逐项精确匹配。 */
-static int match_ext_filter(const char *path, const struct stat *st, void *ctx)
-{
-    const ext_filter_t *f = (const ext_filter_t *)ctx;
+/* Function: Check if file matches extension set. Principle: Extract last extension from basename and precisely match against filter list. */
+static int match_ext_filter(const char *path, const struct stat *st, void *ctx) {
+    const ext_filter_t *f = (const ext_filter_t *) ctx;
     const char *base;
     const char *dot;
     int i;
-    (void)st;
+    (void) st;
 
-    if (path == NULL || f == NULL || f->count <= 0)
-    {
+    if (path == NULL || f == NULL || f->count <= 0) {
         return 0;
     }
 
     base = strrchr(path, '/');
     base = (base != NULL) ? (base + 1) : path;
     dot = strrchr(base, '.');
-    if (dot == NULL || dot[1] == '\0')
-    {
+    if (dot == NULL || dot[1] == '\0') {
         return 0;
     }
 
-    for (i = 0; i < f->count; ++i)
-    {
-        if (f->exts[i] != NULL && strcmp(dot + 1, f->exts[i]) == 0)
-        {
+    for (i = 0; i < f->count; ++i) {
+        if (f->exts[i] != NULL && strcmp(dot + 1, f->exts[i]) == 0) {
             return 1;
         }
     }
     return 0;
 }
 
-/* 功能：判断文件是否匹配日期条件。实现原理：依据 before 标志执行“早于阈值”或“晚于等于阈值”比较。 */
-static int match_date_filter(const char *path, const struct stat *st, void *ctx)
-{
-    const date_filter_t *f = (const date_filter_t *)ctx;
-    (void)path;
+/* Function: Check if file matches date condition. Principle: Perform before/after-or-equal comparison based on before flag. */
+static int match_date_filter(const char *path, const struct stat *st, void *ctx) {
+    const date_filter_t *f = (const date_filter_t *) ctx;
+    (void) path;
 
-    if (st == NULL || f == NULL)
-    {
+    if (st == NULL || f == NULL) {
         return 0;
     }
 
-    if (f->before)
-    {
-        return (st->st_ctime < f->threshold) ? 1 : 0;
+    if (f->before) {
+        return (st->st_mtime < f->threshold) ? 1 : 0;
     }
-    return (st->st_ctime >= f->threshold) ? 1 : 0;
+    return (st->st_mtime >= f->threshold) ? 1 : 0;
 }
 
-/* 功能：递归收集匹配文件。实现原理：先做深度上限检查，再 DFS 遍历；目录下探、文件匹配、失败上抛。 */
+/* Function: Recursively collect matching files. Principle: Depth limit check, then DFS traversal; probe directories, match files, bubble up failures. */
 static int collect_matching_files_recursive(const char *dir_path,
                                             int (*matcher)(const char *, const struct stat *, void *),
                                             void *ctx,
                                             file_list_t *out,
                                             int depth,
-                                            int max_depth)
-{
+                                            int max_depth) {
     DIR *dir;
     struct dirent *ent;
 
-    if (depth > max_depth)
-    {
+    if (depth > max_depth) {
         return 0;
     }
 
     dir = opendir(dir_path);
-    if (dir == NULL)
-    {
+    if (dir == NULL) {
         return 0;
     }
 
-    while ((ent = readdir(dir)) != NULL)
-    {
+    while ((ent = readdir(dir)) != NULL) {
         char full[PATH_MAX];
         struct stat st;
 
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
-        {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
             continue;
         }
-        if (snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name) < 0)
-        {
+        if (snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name) < 0) {
             continue;
         }
-        if (stat(full, &st) != 0)
-        {
+        if (stat(full, &st) != 0) {
             continue;
         }
 
-        if (S_ISDIR(st.st_mode))
-        {
-            if (collect_matching_files_recursive(full, matcher, ctx, out, depth + 1, max_depth) != 0)
-            {
+        if (S_ISDIR(st.st_mode)) {
+            if (collect_matching_files_recursive(full, matcher, ctx, out, depth + 1, max_depth) != 0) {
                 closedir(dir);
                 return -1;
             }
             continue;
         }
 
-        if (S_ISREG(st.st_mode) && matcher(full, &st, ctx))
-        {
-            if (file_list_add(out, full) != 0)
-            {
+        if (S_ISREG(st.st_mode) && matcher(full, &st, ctx)) {
+            if (file_list_add(out, full) != 0) {
                 closedir(dir);
                 return -1;
             }
@@ -741,26 +632,22 @@ static int collect_matching_files_recursive(const char *dir_path,
     return 0;
 }
 
-/* 功能：解析 YYYY-MM-DD 日期。实现原理：先做格式与范围校验，再构造 struct tm 并用 mktime 转为本地时间戳。 */
-static int parse_date_ymd(const char *s, time_t *out)
-{
+/* Function: Parse YYYY-MM-DD date. Principle: Format and range check, construct struct tm and convert to local timestamp using mktime. */
+static int parse_date_ymd(const char *s, time_t *out) {
     int y;
     int m;
     int d;
     struct tm tmv;
     time_t t;
 
-    if (s == NULL || out == NULL)
-    {
+    if (s == NULL || out == NULL) {
         return -1;
     }
 
-    if (sscanf(s, "%d-%d-%d", &y, &m, &d) != 3)
-    {
+    if (sscanf(s, "%d-%d-%d", &y, &m, &d) != 3) {
         return -1;
     }
-    if (m < 1 || m > 12 || d < 1 || d > 31)
-    {
+    if (m < 1 || m > 12 || d < 1 || d > 31) {
         return -1;
     }
 
@@ -774,8 +661,7 @@ static int parse_date_ymd(const char *s, time_t *out)
     tmv.tm_isdst = -1;
 
     t = mktime(&tmv);
-    if (t == (time_t)-1)
-    {
+    if (t == (time_t) -1) {
         return -1;
     }
 
@@ -783,9 +669,8 @@ static int parse_date_ymd(const char *s, time_t *out)
     return 0;
 }
 
-/* 功能：将文件列表打包为 tar.gz。实现原理：先写临时清单，再 fork+execl 调 tar，父进程 waitpid 校验退出码并清理。 */
-static int create_temp_archive(const file_list_t *list, char *out_path, size_t out_size)
-{
+/* Function: Pack file list to tar.gz. Principle: Write temp list, fork+execl tar, parent waitpid checks exit code and cleans up. */
+static int create_temp_archive(const file_list_t *list, char *out_path, size_t out_size) {
     char list_path[PATH_MAX];
     FILE *list_fp;
     size_t i;
@@ -796,41 +681,34 @@ static int create_temp_archive(const file_list_t *list, char *out_path, size_t o
     struct sigaction old_chld;
     struct sigaction dfl_chld;
 
-    if (list == NULL || out_path == NULL || out_size == 0 || list->count == 0)
-    {
+    if (list == NULL || out_path == NULL || out_size == 0 || list->count == 0) {
         return -1;
     }
 
     pid = getpid();
     now = time(NULL);
-    if (snprintf(out_path, out_size, "/tmp/w26_temp_%ld.tar.gz", (long)pid) < 0)
-    {
+    if (snprintf(out_path, out_size, "/tmp/w26_temp_%ld.tar.gz", (long)pid) < 0) {
         return -1;
     }
 
-    if (snprintf(list_path, sizeof(list_path), "/tmp/w26_list_%ld_%ld.txt", (long)pid, (long)now) < 0)
-    {
+    if (snprintf(list_path, sizeof(list_path), "/tmp/w26_list_%ld_%ld.txt", (long)pid, (long)now) < 0) {
         return -1;
     }
 
     list_fp = fopen(list_path, "w");
-    if (list_fp == NULL)
-    {
+    if (list_fp == NULL) {
         return -1;
     }
 
-    for (i = 0; i < list->count; ++i)
-    {
-        if (fprintf(list_fp, "%s\n", list->paths[i]) < 0)
-        {
+    for (i = 0; i < list->count; ++i) {
+        if (fprintf(list_fp, "%s\n", list->paths[i]) < 0) {
             fclose(list_fp);
             unlink(list_path);
             return -1;
         }
     }
 
-    if (fclose(list_fp) != 0)
-    {
+    if (fclose(list_fp) != 0) {
         unlink(list_path);
         return -1;
     }
@@ -838,100 +716,84 @@ static int create_temp_archive(const file_list_t *list, char *out_path, size_t o
     memset(&dfl_chld, 0, sizeof(dfl_chld));
     dfl_chld.sa_handler = SIG_DFL;
     sigemptyset(&dfl_chld.sa_mask);
-    if (sigaction(SIGCHLD, &dfl_chld, &old_chld) != 0)
-    {
+    if (sigaction(SIGCHLD, &dfl_chld, &old_chld) != 0) {
         unlink(list_path);
         unlink(out_path);
         return -1;
     }
 
     child = fork();
-    if (child < 0)
-    {
-        (void)sigaction(SIGCHLD, &old_chld, NULL);
+    if (child < 0) {
+        (void) sigaction(SIGCHLD, &old_chld, NULL);
         unlink(list_path);
         unlink(out_path);
         return -1;
     }
 
-    if (child == 0)
-    {
+    if (child == 0) {
         int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0)
-        {
-            (void)dup2(devnull, STDOUT_FILENO);
-            (void)dup2(devnull, STDERR_FILENO);
+        if (devnull >= 0) {
+            (void) dup2(devnull, STDOUT_FILENO);
+            (void) dup2(devnull, STDERR_FILENO);
             close(devnull);
         }
-        execl("/usr/bin/tar", "tar", "-czf", out_path, "-T", list_path, (char *)NULL);
+        execl("/usr/bin/tar", "tar", "-czf", out_path, "-T", list_path, (char *) NULL);
         _exit(127);
     }
 
-    if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
-    {
-        (void)sigaction(SIGCHLD, &old_chld, NULL);
+    if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        (void) sigaction(SIGCHLD, &old_chld, NULL);
         unlink(list_path);
         unlink(out_path);
         return -1;
     }
 
-    (void)sigaction(SIGCHLD, &old_chld, NULL);
+    (void) sigaction(SIGCHLD, &old_chld, NULL);
 
     unlink(list_path);
     return 0;
 }
 
-/* 功能：发送压缩包给客户端。实现原理：先发送 FILE 大小头定义文本/二进制边界，再分块 read+send 直到 EOF。 */
-static int send_archive_file(int client_fd, const char *archive_path)
-{
+/* Function: Send archive to client. Principle: Send FILE size header to define text/binary boundary, then chunked read+send until EOF. */
+static int send_archive_file(int client_fd, const char *archive_path) {
     int fd;
     struct stat st;
     char header[64];
     char buf[4096];
 
-    if (archive_path == NULL)
-    {
+    if (archive_path == NULL) {
         return -1;
     }
 
-    if (stat(archive_path, &st) != 0 || !S_ISREG(st.st_mode))
-    {
+    if (stat(archive_path, &st) != 0 || !S_ISREG(st.st_mode)) {
         return -1;
     }
 
-    if (snprintf(header, sizeof(header), "FILE %ld\n", (long)st.st_size) < 0)
-    {
+    if (snprintf(header, sizeof(header), "FILE %ld\n", (long)st.st_size) < 0) {
         return -1;
     }
-    if (send_all(client_fd, header, strlen(header)) != 0)
-    {
+    if (send_all(client_fd, header, strlen(header)) != 0) {
         return -1;
     }
 
     fd = open(archive_path, O_RDONLY);
-    if (fd < 0)
-    {
+    if (fd < 0) {
         return -1;
     }
 
-    for (;;)
-    {
+    for (;;) {
         ssize_t n = read(fd, buf, sizeof(buf));
-        if (n < 0)
-        {
-            if (errno == EINTR)
-            {
+        if (n < 0) {
+            if (errno == EINTR) {
                 continue;
             }
             close(fd);
             return -1;
         }
-        if (n == 0)
-        {
+        if (n == 0) {
             break;
         }
-        if (send_all(client_fd, buf, (size_t)n) != 0)
-        {
+        if (send_all(client_fd, buf, (size_t) n) != 0) {
             close(fd);
             return -1;
         }
@@ -941,11 +803,10 @@ static int send_archive_file(int client_fd, const char *archive_path)
     return 0;
 }
 
-/* 功能：执行过滤打包并回传。实现原理：统一执行“扫描->空集判定->打包->发送->清理”的流水线。 */
+/* Function: Execute filtered packing and return. Principle: Unified pipeline of scan -> empty check -> pack -> send -> clean. */
 static int handle_archive_query(int client_fd,
                                 int (*matcher)(const char *, const struct stat *, void *),
-                                void *ctx)
-{
+                                void *ctx) {
     const char *root = get_search_root();
     int max_depth = get_max_scan_depth();
     file_list_t list = {0};
@@ -953,19 +814,16 @@ static int handle_archive_query(int client_fd,
     int rc;
 
     rc = collect_matching_files_recursive(root, matcher, ctx, &list, 0, max_depth);
-    if (rc != 0)
-    {
+    if (rc != 0) {
         free_file_list(&list);
         return send_all(client_fd, "No file found\n", 14);
     }
-    if (list.count == 0)
-    {
+    if (list.count == 0) {
         free_file_list(&list);
         return send_all(client_fd, "No file found\n", 14);
     }
 
-    if (create_temp_archive(&list, archive_path, sizeof(archive_path)) != 0)
-    {
+    if (create_temp_archive(&list, archive_path, sizeof(archive_path)) != 0) {
         free_file_list(&list);
         return send_all(client_fd, "No file found\n", 14);
     }
@@ -974,33 +832,29 @@ static int handle_archive_query(int client_fd,
     unlink(archive_path);
     free_file_list(&list);
 
-    if (rc != 0)
-    {
+    if (rc != 0) {
         return -1;
     }
     return 0;
 }
 
-/* 功能：处理 fz size1 size2。实现原理：解析并校验区间参数后构造 size_filter，复用统一归档发送流程。 */
-static int handle_fz(int client_fd, const char *cmd)
-{
+/* Function: Handle fz size1 size2. Principle: Parse and validate range params, construct size_filter, reuse unified archive send pipeline. */
+static int handle_fz(int client_fd, const char *cmd) {
     long min_size;
     long max_size;
     size_filter_t f;
 
-    if (sscanf(cmd, "fz %ld %ld", &min_size, &max_size) != 2 || min_size < 0 || max_size < min_size)
-    {
+    if (sscanf(cmd, "fz %ld %ld", &min_size, &max_size) != 2 || min_size < 0 || max_size < min_size) {
         return send_all(client_fd, "No file found\n", 14);
     }
 
-    f.min_size = (off_t)min_size;
-    f.max_size = (off_t)max_size;
+    f.min_size = (off_t) min_size;
+    f.max_size = (off_t) max_size;
     return handle_archive_query(client_fd, match_size_filter, &f);
 }
 
-/* 功能：处理 ft ext...。实现原理：解析最多 3 个扩展名并封装 ext_filter，复用统一归档发送流程。 */
-static int handle_ft(int client_fd, const char *cmd)
-{
+/* Function: Handle ft ext... Principle: Parse up to 3 extensions, wrap in ext_filter, reuse unified archive send pipeline. */
+static int handle_ft(int client_fd, const char *cmd) {
     char e1[32];
     char e2[32];
     char e3[32];
@@ -1011,21 +865,18 @@ static int handle_ft(int client_fd, const char *cmd)
     e2[0] = '\0';
     e3[0] = '\0';
     parts = sscanf(cmd, "ft %31s %31s %31s", e1, e2, e3);
-    if (parts < 1)
-    {
+    if (parts < 1) {
         return send_all(client_fd, "No file found\n", 14);
     }
 
     memset(&f, 0, sizeof(f));
     f.exts[0] = e1;
     f.count = 1;
-    if (parts >= 2)
-    {
+    if (parts >= 2) {
         f.exts[1] = e2;
         f.count = 2;
     }
-    if (parts >= 3)
-    {
+    if (parts >= 3) {
         f.exts[2] = e3;
         f.count = 3;
     }
@@ -1033,13 +884,11 @@ static int handle_ft(int client_fd, const char *cmd)
     return handle_archive_query(client_fd, match_ext_filter, &f);
 }
 
-/* 功能：处理 fdb/fda 日期命令。实现原理：将日期字符串转阈值时间后按方向过滤，再复用统一归档发送流程。 */
-static int handle_fdx(int client_fd, const char *date_str, int before)
-{
+/* Function: Handle fdb/fda date commands. Principle: Convert date string to threshold time, filter by direction, reuse unified archive send pipeline. */
+static int handle_fdx(int client_fd, const char *date_str, int before) {
     date_filter_t f;
 
-    if (parse_date_ymd(date_str, &f.threshold) != 0)
-    {
+    if (parse_date_ymd(date_str, &f.threshold) != 0) {
         return send_all(client_fd, "No file found\n", 14);
     }
     f.before = before;
@@ -1047,30 +896,26 @@ static int handle_fdx(int client_fd, const char *date_str, int before)
 }
 
 /*
- * 功能：创建并返回服务端监听套接字。
- * 实现原理：按 socket->setsockopt->bind->listen 典型流程创建监听端点，任一步失败都释放已申请资源。
+ * Function: Create and return server listen socket.
+ * Principle: Typical pipeline of socket->setsockopt->bind->listen, release resources on any failure.
  */
-static int create_listen_socket(const server_config_t *cfg)
-{
+static int create_listen_socket(const server_config_t *cfg) {
     int sock_fd;
     int opt = 1;
     struct sockaddr_in addr;
 
-    if (cfg == NULL)
-    {
+    if (cfg == NULL) {
         return -1;
     }
 
-    /* 1) 创建 TCP 套接字 */
+    /* 1) Create TCP socket */
     sock_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_fd < 0)
-    {
+    if (sock_fd < 0) {
         return -1;
     }
 
-    /* 2) 允许端口快速复用，方便重启服务 */
-    if (setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)
-    {
+    /* 2) Allow fast port reuse for easy service restart */
+    if (setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         close(sock_fd);
         return -1;
     }
@@ -1079,29 +924,23 @@ static int create_listen_socket(const server_config_t *cfg)
     addr.sin_family = AF_INET;
     addr.sin_port = htons((unsigned short)cfg->bind_port);
 
-    if (cfg->bind_host != NULL && strcmp(cfg->bind_host, "0.0.0.0") != 0)
-    {
-        if (inet_pton(AF_INET, cfg->bind_host, &addr.sin_addr) != 1)
-        {
+    if (cfg->bind_host != NULL && strcmp(cfg->bind_host, "0.0.0.0") != 0) {
+        if (inet_pton(AF_INET, cfg->bind_host, &addr.sin_addr) != 1) {
             close(sock_fd);
             return -1;
         }
-    }
-    else
-    {
+    } else {
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
     }
 
-    /* 3) 绑定地址与端口 */
-    if (bind(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-    {
+    /* 3) Bind address and port */
+    if (bind(sock_fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
         close(sock_fd);
         return -1;
     }
 
-    /* 4) 开始监听客户端连接 */
-    if (listen(sock_fd, BACKLOG) < 0)
-    {
+    /* 4) Start listening for client connections */
+    if (listen(sock_fd, BACKLOG) < 0) {
         close(sock_fd);
         return -1;
     }
@@ -1110,48 +949,39 @@ static int create_listen_socket(const server_config_t *cfg)
 }
 
 /*
- * 功能：从客户端连接读取一条命令行。
- * 实现原理：逐字节读取到换行并过滤 '\r'；返回值区分“正常一行/对端关闭/错误”，供会话循环精确分支。
+ * Function: Read a command line from client connection.
+ * Principle: Read byte by byte until newline, filter '\r'; return value distinguishes normal line/peer closed/error, for precise session loop branching.
  */
-static int read_command_line(int client_fd, char *buf, size_t size)
-{
-    /* 按行读取命令，以 '\n' 作为一条请求的边界 */
+static int read_command_line(int client_fd, char *buf, size_t size) {
+    /* Read command line by line, '\n' as request boundary */
     size_t idx = 0;
 
-    if (buf == NULL || size == 0)
-    {
+    if (buf == NULL || size == 0) {
         return -1;
     }
 
-    while (idx + 1 < size)
-    {
+    while (idx + 1 < size) {
         char ch;
         ssize_t n = recv(client_fd, &ch, 1, 0);
 
-        if (n < 0)
-        {
-            if (errno == EINTR)
-            {
+        if (n < 0) {
+            if (errno == EINTR) {
                 continue;
             }
             return -1;
         }
-        if (n == 0)
-        {
-            if (idx == 0)
-            {
+        if (n == 0) {
+            if (idx == 0) {
                 return 0;
             }
             break;
         }
 
-        if (ch == '\n')
-        {
+        if (ch == '\n') {
             break;
         }
 
-        if (ch != '\r')
-        {
+        if (ch != '\r') {
             buf[idx++] = ch;
         }
     }
@@ -1161,25 +991,22 @@ static int read_command_line(int client_fd, char *buf, size_t size)
 }
 
 /*
- * 功能：处理单条客户端命令并返回响应。
- * 实现原理：mirror2 作为最终设计中的真实业务节点，直接在本地完成控制命令、目录检索和归档命令处理；
- * 未匹配命令走 ACK 回退，便于保留调试与扩展空间。
+ * Function: Process single client command and return response.
+ * Principle: mirror2 as real service node, locally completes control commands, directory retrieval and archiving;
+ * Unmatched commands fallback to ACK, preserving debug and extension space.
  */
-static int process_command(int client_fd, const char *cmd)
-{
+static int process_command(int client_fd, const char *cmd) {
     char resp[MAX_COMMAND_LEN + 64];
     char date_buf[32];
-    if (strcmp(cmd, "PING") == 0)
-    {
+    if (strcmp(cmd, "PING") == 0) {
         return send_all(client_fd, "PONG mirror2\n", 13);
     }
 
     /*
-     * CONNECT_PROBE: 客户端被 w26server REDIRECT 到本节点后发送的探测命令。
-     * 回复 "CONNECTED mirrorN host port"，客户端据此确认已到达最终服务节点并显示节点信息。
+     * CONNECT_PROBE: Probe command sent by client after getting REDIRECT from w26server to this node.
+     * Reply "CONNECTED mirrorN host port", client confirms reaching final node and shows node info.
      */
-    if (strcmp(cmd, "CONNECT_PROBE") == 0)
-    {
+    if (strcmp(cmd, "CONNECT_PROBE") == 0) {
         char line_buf[128];
         snprintf(line_buf, sizeof(line_buf),
                  "CONNECTED %s %s %d\n",
@@ -1187,54 +1014,44 @@ static int process_command(int client_fd, const char *cmd)
         return send_all(client_fd, line_buf, strlen(line_buf));
     }
 
-    if (strcmp(cmd, "dirlist -a") == 0)
-    {
+    if (strcmp(cmd, "dirlist -a") == 0) {
         return handle_dirlist_a(client_fd);
     }
 
-    if (strcmp(cmd, "dirlist -t") == 0)
-    {
+    if (strcmp(cmd, "dirlist -t") == 0) {
         return handle_dirlist_t(client_fd);
     }
 
-    if (strncmp(cmd, "fn ", 3) == 0)
-    {
+    if (strncmp(cmd, "fn ", 3) == 0) {
         const char *filename = cmd + 3;
-        while (*filename == ' ')
-        {
+        while (*filename == ' ') {
             filename++;
         }
         return handle_fn(client_fd, filename);
     }
 
-    if (strncmp(cmd, "fz ", 3) == 0)
-    {
+    if (strncmp(cmd, "fz ", 3) == 0) {
         return handle_fz(client_fd, cmd);
     }
 
-    if (strncmp(cmd, "ft ", 3) == 0)
-    {
+    if (strncmp(cmd, "ft ", 3) == 0) {
         return handle_ft(client_fd, cmd);
     }
 
-    if (sscanf(cmd, "fdb %31s", date_buf) == 1)
-    {
+    if (sscanf(cmd, "fdb %31s", date_buf) == 1) {
         return handle_fdx(client_fd, date_buf, 1);
     }
 
-    if (sscanf(cmd, "fda %31s", date_buf) == 1)
-    {
+    if (sscanf(cmd, "fda %31s", date_buf) == 1) {
         return handle_fdx(client_fd, date_buf, 0);
     }
 
-    if (cmd == NULL)
-    {
+    if (cmd == NULL) {
         return -1;
     }
 
-    /* 未匹配命令返回 ACK，保留调试与扩展入口。 */
-    if (snprintf(resp, sizeof(resp), "ACK from %s: %s\n", NODE_NAME, cmd) < 0)
-    {
+    /* Unmatched commands return ACK, preserving debugging and extension entry. */
+    if (snprintf(resp, sizeof(resp), "ACK from %s: %s\n", NODE_NAME, cmd) < 0) {
         return -1;
     }
 
@@ -1242,91 +1059,79 @@ static int process_command(int client_fd, const char *cmd)
 }
 
 /*
- * 功能：处理单个客户端会话生命周期。
- * 实现原理：每个连接由子进程独占服务，循环执行“读一行->本地分发->回包”；quitc 主动回 BYE，
- * 异常或断连即结束会话，连接内不再做二次路由。
+ * Function: Handle single client session lifecycle.
+ * Principle: Each connection exclusively served by child process, loops read line -> local dispatch -> reply; quitc actively replies BYE,
+ * ends session on exception or disconnect, no secondary routing within connection.
  */
-static void crequest(int client_fd)
-{
-    /* 每个客户端连接由一个子进程独占处理。 */
+static void crequest(int client_fd) {
+    /* Each client connection exclusively handled by a child process. */
     char cmd[MAX_COMMAND_LEN];
 
-    for (;;)
-    {
-        /* 会话循环：持续读命令，直到断连或 quitc */
+    for (;;) {
+        /* Session loop: continually read command until disconnect or quitc */
         int rc = read_command_line(client_fd, cmd, sizeof(cmd));
-        if (rc <= 0)
-        {
+        if (rc <= 0) {
             break;
         }
 
-        if (strcmp(cmd, "quitc") == 0)
-        {
-            /* 客户端主动结束会话 */
-            (void)send_all(client_fd, "BYE\n", 4);
+        if (strcmp(cmd, "quitc") == 0) {
+            /* Client actively ends session */
+            (void) send_all(client_fd, "BYE\n", 4);
             break;
         }
 
-        if (process_command(client_fd, cmd) != 0)
-        {
+        if (process_command(client_fd, cmd) != 0) {
             break;
         }
     }
 }
 
 /*
- * 功能：启动服务端主循环并并发处理客户端。
- * 实现原理：父进程长期 accept，新连接按该节点的职责直接 fork 子进程独立处理；父进程关闭已复制的
- * 客户端 fd 后继续监听，实现进程级并发与连接级固定归属。
+ * Function: Start server main loop and concurrently handle clients.
+ * Principle: Parent long-term accept, fork child for new connection to handle independently based on node duty; parent closes duplicated
+ * client fd and continues listening, achieving process-level concurrency and connection-level fixed attribution.
  */
-static int run_server(const server_config_t *cfg)
-{
+static int run_server(const server_config_t *cfg) {
     int listen_fd = create_listen_socket(cfg);
-    if (listen_fd < 0)
-    {
+    if (listen_fd < 0) {
         fprintf(stderr, "%s: failed to create listen socket (skeleton)\n", NODE_NAME);
         return 1;
     }
 
-    /* 子进程退出自动回收，避免僵尸进程 */
+    /* Auto reap child process exit to avoid zombies */
     signal(SIGCHLD, SIG_IGN);
 
-    for (;;)
-    {
+    for (;;) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
-        /* 主进程阻塞等待新连接 */
-        int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
+        /* Main process blocks waiting for new connection */
+        int client_fd = accept(listen_fd, (struct sockaddr *) &client_addr, &client_len);
 
-        if (client_fd < 0)
-        {
-            if (errno == EINTR)
-            {
+        if (client_fd < 0) {
+            if (errno == EINTR) {
                 continue;
             }
             perror("accept");
             continue;
         }
 
-        /* 每个客户端连接 fork 一个子进程独占处理 */
+        /* Fork a child process to exclusively handle each client connection */
         pid_t pid = fork();
-        if (pid < 0)
-        {
+        if (pid < 0) {
             perror("fork");
             close(client_fd);
             continue;
         }
 
-        if (pid == 0)
-        {
-            /* 子进程只负责当前连接，处理完即退出 */
+        if (pid == 0) {
+            /* Child process handles only current connection, exits when done */
             close(listen_fd);
             crequest(client_fd);
             close(client_fd);
             _exit(0);
         }
 
-        /* 父进程关闭已复制的客户端 fd，继续 accept */
+        /* Parent process closes duplicated client fd and continues accept */
         close(client_fd);
     }
 
@@ -1335,14 +1140,13 @@ static int run_server(const server_config_t *cfg)
 }
 
 /*
- * 功能：程序入口，初始化配置并启动 mirror2 服务端。
- * 实现原理：mirror2 先启动心跳线程向主服上报在线状态，再进入监听循环，作为最终设计中的实际业务节点
- * 直接处理其归属连接。
+ * Function: Program entry, initialize config and start mirror2 server.
+ * Principle: mirror2 starts heartbeat thread to report online status to primary server, then enters listen loop, as actual service node
+ * in final design, directly handling its attributed connections.
  */
-int main(void)
-{
+int main(void) {
     server_config_t cfg;
-    /* 默认监听所有网卡。 */
+    /* Listen on all interfaces by default. */
     cfg.bind_host = "0.0.0.0";
     cfg.bind_port = DEFAULT_PORT;
 
