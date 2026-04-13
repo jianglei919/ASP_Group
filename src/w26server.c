@@ -29,48 +29,59 @@
 #define MIRROR2_HOST "127.0.0.1"
 #define MIRROR2_PORT 5002
 
+static int g_primary_port = DEFAULT_PORT;
+static int g_mirror1_port = MIRROR1_PORT;
+static int g_mirror2_port = MIRROR2_PORT;
+
 // Server configuration structure
-typedef struct server_config {
+typedef struct server_config
+{
     const char *bind_host; // Listen address, typically 0.0.0.0
-    int bind_port; // Listen port, clients and mirror nodes access primary service here
+    int bind_port;         // Listen port, clients and mirror nodes access primary service here
 } server_config_t;
 
 // Directory item structure
-typedef struct dir_item {
-    char *name; // Directory name (without parent path), for dirlist output
+typedef struct dir_item
+{
+    char *name;   // Directory name (without parent path), for dirlist output
     time_t ctime; // Directory timestamp, for dirlist -t sorting
 } dir_item_t;
 
 // File list structure
-typedef struct file_list {
+typedef struct file_list
+{
     char **paths; // Dynamic path array, each element is the absolute path of a hit file
     size_t count; // Current number of hit files
 } file_list_t;
 
 // Size filter structure
-typedef struct size_filter {
+typedef struct size_filter
+{
     off_t min_size; // Minimum file size (inclusive)
     off_t max_size; // Maximum file size (inclusive)
 } size_filter_t;
 
 // Extension filter structure
-typedef struct ext_filter {
+typedef struct ext_filter
+{
     const char *exts[3]; // Allowed extensions, up to 3
-    int count; // Number of valid extensions.
+    int count;           // Number of valid extensions.
 } ext_filter_t;
 
 // Date filter structure
-typedef struct date_filter {
+typedef struct date_filter
+{
     time_t threshold; // Date threshold timestamp (local timezone)
-    int before; // 1 for fdb (before threshold), 0 for fda (after or equal)
+    int before;       // 1 for fdb (before threshold), 0 for fda (after or equal)
 } date_filter_t;
 
 // Routing node structure
-typedef struct route_node {
+typedef struct route_node
+{
     const char *name; // Node name
     const char *host; // Node listen address
-    int port; // Node listen port
-    int online; // Online flag, 1 for valid heartbeat, 0 for offline
+    int port;         // Node listen port
+    int online;       // Online flag, 1 for valid heartbeat, 0 for offline
 } route_node_t;
 
 /*
@@ -78,23 +89,28 @@ typedef struct route_node {
  * Principle: TCP send may short-write, so loop and retry with an offset until the specified length is sent.
  * Handles EINTR interrupts; treats 0 or other errors as connection failures.
  */
-static int send_all(int fd, const char *data, size_t len) {
+static int send_all(int fd, const char *data, size_t len)
+{
     /* Loop sending to avoid data loss on incomplete send */
     size_t sent = 0;
 
-    while (sent < len) {
+    while (sent < len)
+    {
         // Send the data to the client
         ssize_t n = send(fd, data + sent, len - sent, 0);
-        if (n < 0) {
-            if (errno == EINTR) {
+        if (n < 0)
+        {
+            if (errno == EINTR)
+            {
                 continue;
             }
             return -1;
         }
-        if (n == 0) {
+        if (n == 0)
+        {
             return -1;
         }
-        sent += (size_t) n;
+        sent += (size_t)n;
     }
 
     return 0;
@@ -106,32 +122,36 @@ static int send_all(int fd, const char *data, size_t len) {
  * If missing or invalid, initializes to 0 and returns safely to default to offline,
  * ensuring state read errors do not crash the server.
  */
-static int load_heartbeat_status(time_t *mirror1_ts, time_t *mirror2_ts) {
+static int load_heartbeat_status(time_t *mirror1_ts, time_t *mirror2_ts)
+{
     FILE *fp;
     long t1 = 0;
     long t2 = 0;
 
-    if (mirror1_ts == NULL || mirror2_ts == NULL) {
+    if (mirror1_ts == NULL || mirror2_ts == NULL)
+    {
         return -1;
     }
     // Open the status file for reading
     fp = fopen(STATUS_FILE, "r");
-    if (fp == NULL) {
-        *mirror1_ts = (time_t) 0;
-        *mirror2_ts = (time_t) 0;
+    if (fp == NULL)
+    {
+        *mirror1_ts = (time_t)0;
+        *mirror2_ts = (time_t)0;
         return -1;
     }
     // Read the heartbeat times from the status file
-    if (fscanf(fp, "%ld %ld", &t1, &t2) != 2) {
+    if (fscanf(fp, "%ld %ld", &t1, &t2) != 2)
+    {
         fclose(fp);
-        *mirror1_ts = (time_t) 0;
-        *mirror2_ts = (time_t) 0;
+        *mirror1_ts = (time_t)0;
+        *mirror2_ts = (time_t)0;
         return -1;
     }
 
     fclose(fp);
-    *mirror1_ts = (time_t) t1;
-    *mirror2_ts = (time_t) t2;
+    *mirror1_ts = (time_t)t1;
+    *mirror2_ts = (time_t)t2;
     return 0;
 }
 
@@ -140,15 +160,18 @@ static int load_heartbeat_status(time_t *mirror1_ts, time_t *mirror2_ts) {
  * Principle: Overwrites the state file on every update to ensure a single up-to-date snapshot.
  * GET_NODES always reads the consistently updated state.
  */
-static int save_heartbeat_status(time_t mirror1_ts, time_t mirror2_ts) {
+static int save_heartbeat_status(time_t mirror1_ts, time_t mirror2_ts)
+{
     FILE *fp;
     // Open the status file for writing
     fp = fopen(STATUS_FILE, "w");
-    if (fp == NULL) {
+    if (fp == NULL)
+    {
         return -1;
     }
     // Write the heartbeat times to the status file
-    if (fprintf(fp, "%ld %ld\n", (long) mirror1_ts, (long) mirror2_ts) < 0) {
+    if (fprintf(fp, "%ld %ld\n", (long)mirror1_ts, (long)mirror2_ts) < 0)
+    {
         fclose(fp);
         return -1;
     }
@@ -162,23 +185,30 @@ static int save_heartbeat_status(time_t mirror1_ts, time_t mirror2_ts) {
  * Principle: Read-modify-write to update only the specific mirror without resetting the other.
  * This prevents false zeroing of the other node during updates.
  */
-static int update_heartbeat(const char *node_name) {
-    time_t mirror1_ts = (time_t) 0;
-    time_t mirror2_ts = (time_t) 0;
+static int update_heartbeat(const char *node_name)
+{
+    time_t mirror1_ts = (time_t)0;
+    time_t mirror2_ts = (time_t)0;
     time_t now = time(NULL);
 
-    if (node_name == NULL) {
+    if (node_name == NULL)
+    {
         return -1;
     }
 
     // Load the heartbeat times from the status file
-    (void) load_heartbeat_status(&mirror1_ts, &mirror2_ts);
+    (void)load_heartbeat_status(&mirror1_ts, &mirror2_ts);
 
-    if (strcmp(node_name, "mirror1") == 0) {
+    if (strcmp(node_name, "mirror1") == 0)
+    {
         mirror1_ts = now;
-    } else if (strcmp(node_name, "mirror2") == 0) {
+    }
+    else if (strcmp(node_name, "mirror2") == 0)
+    {
         mirror2_ts = now;
-    } else {
+    }
+    else
+    {
         return -1;
     }
 
@@ -191,18 +221,20 @@ static int update_heartbeat(const char *node_name) {
  * Principle: Checks heartbeat TTL for mirrors and formats into string for client routing decisions.
  * Encodes evenly into a single-line protocol text for quick parsing.
  */
-static int build_nodes_status_line(char *out, size_t out_size) {
-    time_t mirror1_ts = (time_t) 0;
-    time_t mirror2_ts = (time_t) 0;
+static int build_nodes_status_line(char *out, size_t out_size)
+{
+    time_t mirror1_ts = (time_t)0;
+    time_t mirror2_ts = (time_t)0;
     time_t now = time(NULL);
     int mirror1_online;
     int mirror2_online;
 
-    if (out == NULL || out_size == 0) {
+    if (out == NULL || out_size == 0)
+    {
         return -1;
     }
 
-    (void) load_heartbeat_status(&mirror1_ts, &mirror2_ts);
+    (void)load_heartbeat_status(&mirror1_ts, &mirror2_ts);
 
     mirror1_online = (mirror1_ts > 0 && (now - mirror1_ts) <= HEARTBEAT_TTL_SEC) ? 1 : 0;
     mirror2_online = (mirror2_ts > 0 && (now - mirror2_ts) <= HEARTBEAT_TTL_SEC) ? 1 : 0;
@@ -211,7 +243,8 @@ static int build_nodes_status_line(char *out, size_t out_size) {
                  out_size,
                  "NODES w26server=1 mirror1=%d mirror2=%d\n",
                  mirror1_online,
-                 mirror2_online) < 0) {
+                 mirror2_online) < 0)
+    {
         return -1;
     }
 
@@ -223,7 +256,8 @@ static int build_nodes_status_line(char *out, size_t out_size) {
  * Principle: Maps owner/group/other permissions into a 9-character rwx string,
  * generating a 9-char string null-terminated for fn output metadata.
  */
-static void format_permissions(mode_t mode, char out[10]) {
+static void format_permissions(mode_t mode, char out[10])
+{
     out[0] = (mode & S_IRUSR) ? 'r' : '-';
     out[1] = (mode & S_IWUSR) ? 'w' : '-';
     out[2] = (mode & S_IXUSR) ? 'x' : '-';
@@ -237,38 +271,45 @@ static void format_permissions(mode_t mode, char out[10]) {
 }
 
 /* Function: Lexicographical comparator for dir_item by name. */
-static int cmp_dir_by_name(const void *a, const void *b) {
-    const dir_item_t *da = (const dir_item_t *) a;
-    const dir_item_t *db = (const dir_item_t *) b;
+static int cmp_dir_by_name(const void *a, const void *b)
+{
+    const dir_item_t *da = (const dir_item_t *)a;
+    const dir_item_t *db = (const dir_item_t *)b;
     return strcmp(da->name, db->name);
 }
 
 /* Function: Ascending comparator for dir_item by creation time. Ties broken by name. */
-static int cmp_dir_by_ctime(const void *a, const void *b) {
-    const dir_item_t *da = (const dir_item_t *) a;
-    const dir_item_t *db = (const dir_item_t *) b;
+static int cmp_dir_by_ctime(const void *a, const void *b)
+{
+    const dir_item_t *da = (const dir_item_t *)a;
+    const dir_item_t *db = (const dir_item_t *)b;
 
-    if (da->ctime < db->ctime) {
+    if (da->ctime < db->ctime)
+    {
         return -1;
     }
-    if (da->ctime > db->ctime) {
+    if (da->ctime > db->ctime)
+    {
         return 1;
     }
     return strcmp(da->name, db->name);
 }
 
 /* Function: Duplicate a string using explicit malloc/memcpy. */
-static char *dup_string(const char *s) {
+static char *dup_string(const char *s)
+{
     size_t len;
     char *p;
 
-    if (s == NULL) {
+    if (s == NULL)
+    {
         return NULL;
     }
 
     len = strlen(s);
-    p = (char *) malloc(len + 1);
-    if (p == NULL) {
+    p = (char *)malloc(len + 1);
+    if (p == NULL)
+    {
         return NULL;
     }
     memcpy(p, s, len + 1);
@@ -280,36 +321,71 @@ static char *dup_string(const char *s) {
  * Principle: Falls back predictably: W26_SEARCH_ROOT -> HOME -> current working directory.
  * Guarantees service functionality even in minimal environments.
  */
-static const char *get_search_root(void) {
+static const char *get_search_root(void)
+{
     const char *custom = getenv("W26_SEARCH_ROOT");
     const char *home = getenv("HOME");
 
-    if (custom != NULL && custom[0] != '\0') {
+    if (custom != NULL && custom[0] != '\0')
+    {
         return custom;
     }
     return (home != NULL && home[0] != '\0') ? home : ".";
 }
 
 /* Function: Get maximum recursive scan depth, reads W26_MAX_SCAN_DEPTH from env. */
-static int get_max_scan_depth(void) {
+static int get_max_scan_depth(void)
+{
     const char *s = getenv("W26_MAX_SCAN_DEPTH");
     char *end = NULL;
     long v;
     // Check if the W26_MAX_SCAN_DEPTH is set
-    if (s == NULL || s[0] == '\0') {
+    if (s == NULL || s[0] == '\0')
+    {
         return DEFAULT_MAX_SCAN_DEPTH;
     }
     // Convert the W26_MAX_SCAN_DEPTH into a long
     v = strtol(s, &end, 10);
-    if (end == s || *end != '\0' || v < 1 || v > 64) {
+    if (end == s || *end != '\0' || v < 1 || v > 64)
+    {
         return DEFAULT_MAX_SCAN_DEPTH;
     }
 
-    return (int) v;
+    return (int)v;
+}
+
+/* Function: Parse and validate runtime port from environment. */
+static int parse_port_env(const char *name, int fallback)
+{
+    const char *s = getenv(name);
+    char *end = NULL;
+    long v;
+
+    if (s == NULL || s[0] == '\0')
+    {
+        return fallback;
+    }
+
+    v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v < 1 || v > 65535)
+    {
+        return fallback;
+    }
+
+    return (int)v;
+}
+
+/* Function: Load all runtime ports from env with safe defaults. */
+static void load_runtime_ports(void)
+{
+    g_primary_port = parse_port_env("W26_PRIMARY_PORT", DEFAULT_PORT);
+    g_mirror1_port = parse_port_env("W26_MIRROR1_PORT", MIRROR1_PORT);
+    g_mirror2_port = parse_port_env("W26_MIRROR2_PORT", MIRROR2_PORT);
 }
 
 /* Function: Collect all subdirectories immediately under the search root. */
-static int collect_subdirs(dir_item_t **out_items, size_t *out_count) {
+static int collect_subdirs(dir_item_t **out_items, size_t *out_count)
+{
     const char *root = get_search_root();
     DIR *dir;
     struct dirent *ent;
@@ -317,7 +393,8 @@ static int collect_subdirs(dir_item_t **out_items, size_t *out_count) {
     size_t count = 0;
     int ok = 0;
 
-    if (out_items == NULL || out_count == NULL) {
+    if (out_items == NULL || out_count == NULL)
+    {
         return -1;
     }
 
@@ -325,36 +402,43 @@ static int collect_subdirs(dir_item_t **out_items, size_t *out_count) {
     *out_count = 0;
     // Open the root directory for reading
     dir = opendir(root);
-    if (dir == NULL) {
+    if (dir == NULL)
+    {
         return -1;
     }
     // Read the directory entries
-    while ((ent = readdir(dir)) != NULL) {
+    while ((ent = readdir(dir)) != NULL)
+    {
         char full[PATH_MAX];
         struct stat st;
         char *name_copy;
         dir_item_t *tmp;
         // Skip the current and parent directories
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+        {
             continue;
         }
         // Format the full path
-        if (snprintf(full, sizeof(full), "%s/%s", root, ent->d_name) < 0) {
+        if (snprintf(full, sizeof(full), "%s/%s", root, ent->d_name) < 0)
+        {
             continue;
         }
         // Check if the entry is a directory
-        if (stat(full, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        if (stat(full, &st) != 0 || !S_ISDIR(st.st_mode))
+        {
             continue;
         }
 
         name_copy = dup_string(ent->d_name);
-        if (name_copy == NULL) {
+        if (name_copy == NULL)
+        {
             ok = -1;
             break;
         }
         // Reallocate the items array
-        tmp = (dir_item_t *) realloc(items, (count + 1) * sizeof(dir_item_t));
-        if (tmp == NULL) {
+        tmp = (dir_item_t *)realloc(items, (count + 1) * sizeof(dir_item_t));
+        if (tmp == NULL)
+        {
             free(name_copy);
             ok = -1;
             break;
@@ -367,9 +451,11 @@ static int collect_subdirs(dir_item_t **out_items, size_t *out_count) {
     }
     closedir(dir);
 
-    if (ok != 0) {
+    if (ok != 0)
+    {
         size_t i;
-        for (i = 0; i < count; ++i) {
+        for (i = 0; i < count; ++i)
+        {
             free(items[i].name);
         }
         free(items);
@@ -382,20 +468,26 @@ static int collect_subdirs(dir_item_t **out_items, size_t *out_count) {
 }
 
 /* Function: Send directory list as a single space-separated text line. */
-static int send_dirlist_line(int client_fd, dir_item_t *items, size_t count) {
+static int send_dirlist_line(int client_fd, dir_item_t *items, size_t count)
+{
     size_t i;
     // Check if the count is 0
-    if (count == 0) {
+    if (count == 0)
+    {
         return send_all(client_fd, "No directory found\n", 19);
     }
     // Send the directory list
-    for (i = 0; i < count; ++i) {
+    for (i = 0; i < count; ++i)
+    {
         size_t len = strlen(items[i].name);
-        if (send_all(client_fd, items[i].name, len) != 0) {
+        if (send_all(client_fd, items[i].name, len) != 0)
+        {
             return -1;
         }
-        if (i + 1 < count) {
-            if (send_all(client_fd, " ", 1) != 0) {
+        if (i + 1 < count)
+        {
+            if (send_all(client_fd, " ", 1) != 0)
+            {
                 return -1;
             }
         }
@@ -405,21 +497,25 @@ static int send_dirlist_line(int client_fd, dir_item_t *items, size_t count) {
 }
 
 /* Function: Free dynamically allocated directory collection memory. */
-static void free_dir_items(dir_item_t *items, size_t count) {
+static void free_dir_items(dir_item_t *items, size_t count)
+{
     size_t i;
-    for (i = 0; i < count; ++i) {
+    for (i = 0; i < count; ++i)
+    {
         free(items[i].name);
     }
     free(items);
 }
 
 /* Function: Handle dirlist -a command using a full collect-sort-send-free pipeline. */
-static int handle_dirlist_a(int client_fd) {
+static int handle_dirlist_a(int client_fd)
+{
     dir_item_t *items = NULL;
     size_t count = 0;
     int rc;
 
-    if (collect_subdirs(&items, &count) != 0) {
+    if (collect_subdirs(&items, &count) != 0)
+    {
         return send_all(client_fd, "No directory found\n", 19);
     }
 
@@ -430,12 +526,14 @@ static int handle_dirlist_a(int client_fd) {
 }
 
 /* Function: Handle dirlist -t command using a full collect-sort-send-free pipeline. */
-static int handle_dirlist_t(int client_fd) {
+static int handle_dirlist_t(int client_fd)
+{
     dir_item_t *items = NULL;
     size_t count = 0;
     int rc;
 
-    if (collect_subdirs(&items, &count) != 0) {
+    if (collect_subdirs(&items, &count) != 0)
+    {
         return send_all(client_fd, "No directory found\n", 19);
     }
 
@@ -450,40 +548,50 @@ static int handle_dirlist_t(int client_fd) {
  * Principle: Executes DFS on the directory tree, returns early on the first match to minimize latency.
  * Returns immediately on hit, skipping meaningless traversal.
  */
-static int find_first_file(const char *dir_path, const char *target_name, char *out_path, size_t out_size) {
+static int find_first_file(const char *dir_path, const char *target_name, char *out_path, size_t out_size)
+{
     DIR *dir;
     struct dirent *ent;
     // Open the directory for reading
     dir = opendir(dir_path);
-    if (dir == NULL) {
+    if (dir == NULL)
+    {
         return 0;
     }
     // Read the directory entries
-    while ((ent = readdir(dir)) != NULL) {
+    while ((ent = readdir(dir)) != NULL)
+    {
         char full[PATH_MAX];
         struct stat st;
         // Skip the current and parent directories
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+        {
             continue;
         }
         // Format the full path
-        if (snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name) < 0) {
+        if (snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name) < 0)
+        {
             continue;
         }
-        if (stat(full, &st) != 0) {
+        if (stat(full, &st) != 0)
+        {
             continue;
         }
         // Check if the entry is a directory
-        if (S_ISDIR(st.st_mode)) {
-            if (find_first_file(full, target_name, out_path, out_size)) {
+        if (S_ISDIR(st.st_mode))
+        {
+            if (find_first_file(full, target_name, out_path, out_size))
+            {
                 closedir(dir);
                 return 1;
             }
             continue;
         }
         // Check if the entry is a regular file and the name matches the target name
-        if (S_ISREG(st.st_mode) && strcmp(ent->d_name, target_name) == 0) {
-            if (snprintf(out_path, out_size, "%s", full) >= 0) {
+        if (S_ISREG(st.st_mode) && strcmp(ent->d_name, target_name) == 0)
+        {
+            if (snprintf(out_path, out_size, "%s", full) >= 0)
+            {
                 closedir(dir);
                 return 1;
             }
@@ -500,7 +608,8 @@ static int find_first_file(const char *dir_path, const char *target_name, char *
  * Returns "File not found" on failure at any step,
  * keeping client handling branch simple.
  */
-static int handle_fn(int client_fd, const char *filename) {
+static int handle_fn(int client_fd, const char *filename)
+{
     const char *root = get_search_root();
     char path[PATH_MAX];
     struct stat st;
@@ -510,24 +619,30 @@ static int handle_fn(int client_fd, const char *filename) {
     char resp[1024];
     const char *base;
     // Check if the filename is NULL or empty
-    if (filename == NULL || filename[0] == '\0') {
+    if (filename == NULL || filename[0] == '\0')
+    {
         return send_all(client_fd, "File not found\n", 15);
     }
     // Find the first file matching the target name
-    if (!find_first_file(root, filename, path, sizeof(path))) {
+    if (!find_first_file(root, filename, path, sizeof(path)))
+    {
         return send_all(client_fd, "File not found\n", 15);
     }
 
-    if (stat(path, &st) != 0) {
+    if (stat(path, &st) != 0)
+    {
         return send_all(client_fd, "File not found\n", 15);
     }
     // Format the permissions
     format_permissions(st.st_mode, perm);
     tm_info = localtime(&st.st_ctime);
-    if (tm_info == NULL) {
+    if (tm_info == NULL)
+    {
         snprintf(time_buf, sizeof(time_buf), "unknown");
-    } else {
-        (void) strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+    }
+    else
+    {
+        (void)strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
     }
 
     // Get the base name of the file
@@ -540,7 +655,8 @@ static int handle_fn(int client_fd, const char *filename) {
                  base,
                  (long)st.st_size,
                  time_buf,
-                 perm) < 0) {
+                 perm) < 0)
+    {
         return -1;
     }
 
@@ -548,21 +664,25 @@ static int handle_fn(int client_fd, const char *filename) {
 }
 
 /* Function: Append a single path to the file_list structure. */
-static int file_list_add(file_list_t *list, const char *path) {
+static int file_list_add(file_list_t *list, const char *path)
+{
     char **tmp;
     char *copy;
 
-    if (list == NULL || path == NULL) {
+    if (list == NULL || path == NULL)
+    {
         return -1;
     }
 
     copy = dup_string(path);
-    if (copy == NULL) {
+    if (copy == NULL)
+    {
         return -1;
     }
 
-    tmp = (char **) realloc(list->paths, (list->count + 1) * sizeof(char *));
-    if (tmp == NULL) {
+    tmp = (char **)realloc(list->paths, (list->count + 1) * sizeof(char *));
+    if (tmp == NULL)
+    {
         free(copy);
         return -1;
     }
@@ -573,14 +693,17 @@ static int file_list_add(file_list_t *list, const char *path) {
 }
 
 /* Function: Free the file_list structure and its contents. */
-static void free_file_list(file_list_t *list) {
+static void free_file_list(file_list_t *list)
+{
     size_t i;
 
-    if (list == NULL) {
+    if (list == NULL)
+    {
         return;
     }
 
-    for (i = 0; i < list->count; ++i) {
+    for (i = 0; i < list->count; ++i)
+    {
         free(list->paths[i]);
     }
     free(list->paths);
@@ -589,37 +712,44 @@ static void free_file_list(file_list_t *list) {
 }
 
 /* Function: Filter files strictly within the specified min/max size range (inclusive). */
-static int match_size_filter(const char *path, const struct stat *st, void *ctx) {
-    const size_filter_t *f = (const size_filter_t *) ctx;
-    (void) path;
+static int match_size_filter(const char *path, const struct stat *st, void *ctx)
+{
+    const size_filter_t *f = (const size_filter_t *)ctx;
+    (void)path;
 
-    if (st == NULL || f == NULL) {
+    if (st == NULL || f == NULL)
+    {
         return 0;
     }
     return (st->st_size >= f->min_size && st->st_size <= f->max_size) ? 1 : 0;
 }
 
 /* Function: Filter files matching any of the specified extensions. */
-static int match_ext_filter(const char *path, const struct stat *st, void *ctx) {
-    const ext_filter_t *f = (const ext_filter_t *) ctx;
+static int match_ext_filter(const char *path, const struct stat *st, void *ctx)
+{
+    const ext_filter_t *f = (const ext_filter_t *)ctx;
     const char *base;
     const char *dot;
     int i;
-    (void) st;
+    (void)st;
 
-    if (path == NULL || f == NULL || f->count <= 0) {
+    if (path == NULL || f == NULL || f->count <= 0)
+    {
         return 0;
     }
     // Get the base name of the file and the dot
     base = strrchr(path, '/');
     base = (base != NULL) ? (base + 1) : path;
     dot = strrchr(base, '.');
-    if (dot == NULL || dot[1] == '\0') {
+    if (dot == NULL || dot[1] == '\0')
+    {
         return 0;
     }
     // Check if the extension matches any of the specified extensions
-    for (i = 0; i < f->count; ++i) {
-        if (f->exts[i] != NULL && strcmp(dot + 1, f->exts[i]) == 0) {
+    for (i = 0; i < f->count; ++i)
+    {
+        if (f->exts[i] != NULL && strcmp(dot + 1, f->exts[i]) == 0)
+        {
             return 1;
         }
     }
@@ -627,15 +757,18 @@ static int match_ext_filter(const char *path, const struct stat *st, void *ctx) 
 }
 
 /* Function: Filter files created before or strictly on/after a specific timestamp. */
-static int match_date_filter(const char *path, const struct stat *st, void *ctx) {
-    const date_filter_t *f = (const date_filter_t *) ctx;
-    (void) path;
+static int match_date_filter(const char *path, const struct stat *st, void *ctx)
+{
+    const date_filter_t *f = (const date_filter_t *)ctx;
+    (void)path;
 
-    if (st == NULL || f == NULL) {
+    if (st == NULL || f == NULL)
+    {
         return 0;
     }
     // Check if the file was created before the threshold
-    if (f->before) {
+    if (f->before)
+    {
         return (st->st_mtime < f->threshold) ? 1 : 0;
     }
     return (st->st_mtime >= f->threshold) ? 1 : 0;
@@ -647,44 +780,55 @@ static int collect_matching_files_recursive(const char *dir_path,
                                             void *ctx,
                                             file_list_t *out,
                                             int depth,
-                                            int max_depth) {
+                                            int max_depth)
+{
     DIR *dir;
     struct dirent *ent;
     // Check if the depth is greater than the max depth
-    if (depth > max_depth) {
+    if (depth > max_depth)
+    {
         return 0;
     }
     // Open the directory for reading
     dir = opendir(dir_path);
-    if (dir == NULL) {
+    if (dir == NULL)
+    {
         return 0;
     }
     // Read the directory entries
-    while ((ent = readdir(dir)) != NULL) {
+    while ((ent = readdir(dir)) != NULL)
+    {
         char full[PATH_MAX];
         struct stat st;
         // Skip the current and parent directories
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+        {
             continue;
         }
         // Format the full path
-        if (snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name) < 0) {
+        if (snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name) < 0)
+        {
             continue;
         }
-        if (stat(full, &st) != 0) {
+        if (stat(full, &st) != 0)
+        {
             continue;
         }
         // Check if the entry is a directory
-        if (S_ISDIR(st.st_mode)) {
-            if (collect_matching_files_recursive(full, matcher, ctx, out, depth + 1, max_depth) != 0) {
+        if (S_ISDIR(st.st_mode))
+        {
+            if (collect_matching_files_recursive(full, matcher, ctx, out, depth + 1, max_depth) != 0)
+            {
                 closedir(dir);
                 return -1;
             }
             continue;
         }
         // Check if the entry is a regular file and the matcher matches
-        if (S_ISREG(st.st_mode) && matcher(full, &st, ctx)) {
-            if (file_list_add(out, full) != 0) {
+        if (S_ISREG(st.st_mode) && matcher(full, &st, ctx))
+        {
+            if (file_list_add(out, full) != 0)
+            {
                 closedir(dir);
                 return -1;
             }
@@ -696,22 +840,26 @@ static int collect_matching_files_recursive(const char *dir_path,
 }
 
 /* Function: Parse a YYYY-MM-DD date string into a local timezone timestamp. */
-static int parse_date_ymd(const char *s, time_t *out) {
+static int parse_date_ymd(const char *s, time_t *out)
+{
     int y;
     int m;
     int d;
     struct tm tmv;
     time_t t;
 
-    if (s == NULL || out == NULL) {
+    if (s == NULL || out == NULL)
+    {
         return -1;
     }
     // Parse the date string into y, m, d
-    if (sscanf(s, "%d-%d-%d", &y, &m, &d) != 3) {
+    if (sscanf(s, "%d-%d-%d", &y, &m, &d) != 3)
+    {
         return -1;
     }
     // Check if the month is valid
-    if (m < 1 || m > 12 || d < 1 || d > 31) {
+    if (m < 1 || m > 12 || d < 1 || d > 31)
+    {
         return -1;
     }
     // Initialize the tm structure
@@ -725,7 +873,8 @@ static int parse_date_ymd(const char *s, time_t *out) {
     tmv.tm_isdst = -1;
 
     t = mktime(&tmv);
-    if (t == (time_t) -1) {
+    if (t == (time_t)-1)
+    {
         return -1;
     }
 
@@ -734,7 +883,8 @@ static int parse_date_ymd(const char *s, time_t *out) {
 }
 
 /* Function: Create a tar.gz archive from a list of files via external tar executable. */
-static int create_temp_archive(const file_list_t *list, char *out_path, size_t out_size) {
+static int create_temp_archive(const file_list_t *list, char *out_path, size_t out_size)
+{
     char list_path[PATH_MAX];
     FILE *list_fp;
     size_t i;
@@ -745,28 +895,34 @@ static int create_temp_archive(const file_list_t *list, char *out_path, size_t o
     struct sigaction old_chld;
     struct sigaction dfl_chld;
 
-    if (list == NULL || out_path == NULL || out_size == 0 || list->count == 0) {
+    if (list == NULL || out_path == NULL || out_size == 0 || list->count == 0)
+    {
         return -1;
     }
 
     pid = getpid();
     now = time(NULL);
     // Format the output path
-    if (snprintf(out_path, out_size, "/tmp/w26_temp_%ld.tar.gz", (long)pid) < 0) {
+    if (snprintf(out_path, out_size, "/tmp/w26_temp_%ld.tar.gz", (long)pid) < 0)
+    {
         return -1;
     }
     // Format the list path for the temporary list file
-    if (snprintf(list_path, sizeof(list_path), "/tmp/w26_list_%ld_%ld.txt", (long)pid, (long)now) < 0) {
+    if (snprintf(list_path, sizeof(list_path), "/tmp/w26_list_%ld_%ld.txt", (long)pid, (long)now) < 0)
+    {
         return -1;
     }
     // Open the list file for writing
     list_fp = fopen(list_path, "w");
-    if (list_fp == NULL) {
+    if (list_fp == NULL)
+    {
         return -1;
     }
     // Write the list of files to the temporary list file
-    for (i = 0; i < list->count; ++i) {
-        if (fprintf(list_fp, "%s\n", list->paths[i]) < 0) {
+    for (i = 0; i < list->count; ++i)
+    {
+        if (fprintf(list_fp, "%s\n", list->paths[i]) < 0)
+        {
             fclose(list_fp);
             unlink(list_path);
             return -1;
@@ -774,7 +930,8 @@ static int create_temp_archive(const file_list_t *list, char *out_path, size_t o
     }
 
     // Close the list file
-    if (fclose(list_fp) != 0) {
+    if (fclose(list_fp) != 0)
+    {
         unlink(list_path);
         return -1;
     }
@@ -783,7 +940,8 @@ static int create_temp_archive(const file_list_t *list, char *out_path, size_t o
     // Set the signal handler for the child process to the default handler
     dfl_chld.sa_handler = SIG_DFL;
     sigemptyset(&dfl_chld.sa_mask);
-    if (sigaction(SIGCHLD, &dfl_chld, &old_chld) != 0) {
+    if (sigaction(SIGCHLD, &dfl_chld, &old_chld) != 0)
+    {
         unlink(list_path);
         unlink(out_path);
         return -1;
@@ -791,81 +949,96 @@ static int create_temp_archive(const file_list_t *list, char *out_path, size_t o
 
     child = fork();
     // If the child process is not created, then return -1
-    if (child < 0) {
-        (void) sigaction(SIGCHLD, &old_chld, NULL);
+    if (child < 0)
+    {
+        (void)sigaction(SIGCHLD, &old_chld, NULL);
         unlink(list_path);
         unlink(out_path);
         return -1;
     }
 
     // If the child process is created, then redirect the stdout and stderr to /dev/null
-    if (child == 0) {
+    if (child == 0)
+    {
         int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            (void) dup2(devnull, STDOUT_FILENO);
-            (void) dup2(devnull, STDERR_FILENO);
+        if (devnull >= 0)
+        {
+            (void)dup2(devnull, STDOUT_FILENO);
+            (void)dup2(devnull, STDERR_FILENO);
             close(devnull);
         }
         // Execute the tar command to create the archive and exit the child process
-        execl("/usr/bin/tar", "tar", "-czf", out_path, "-T", list_path, (char *) NULL);
+        execl("/usr/bin/tar", "tar", "-czf", out_path, "-T", list_path, (char *)NULL);
         _exit(127);
     }
 
     // Wait for the child process to exit
-    if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        (void) sigaction(SIGCHLD, &old_chld, NULL);
+    if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    {
+        (void)sigaction(SIGCHLD, &old_chld, NULL);
         unlink(list_path);
         unlink(out_path);
         return -1;
     }
 
-    (void) sigaction(SIGCHLD, &old_chld, NULL);
+    (void)sigaction(SIGCHLD, &old_chld, NULL);
 
     unlink(list_path);
     return 0;
 }
 
 /* Function: Send binary archive to client, prefixed by FILE size protocol header. */
-static int send_archive_file(int client_fd, const char *archive_path) {
+static int send_archive_file(int client_fd, const char *archive_path)
+{
     int fd;
     struct stat st;
     char header[64];
     char buf[4096];
 
-    if (archive_path == NULL) {
+    if (archive_path == NULL)
+    {
         return -1;
     }
     // Check if the archive path is a regular file
-    if (stat(archive_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+    if (stat(archive_path, &st) != 0 || !S_ISREG(st.st_mode))
+    {
         return -1;
     }
     // Format the header for the archive file
-    if (snprintf(header, sizeof(header), "FILE %ld\n", (long)st.st_size) < 0) {
+    if (snprintf(header, sizeof(header), "FILE %ld\n", (long)st.st_size) < 0)
+    {
         return -1;
     }
     // Send the header to the client
-    if (send_all(client_fd, header, strlen(header)) != 0) {
+    if (send_all(client_fd, header, strlen(header)) != 0)
+    {
         return -1;
     }
     // Open the archive file for reading
     fd = open(archive_path, O_RDONLY);
-    if (fd < 0) {
+    if (fd < 0)
+    {
         return -1;
     }
     // Read the archive file and send it to the client
-    for (;;) {
+    for (;;)
+    {
         ssize_t n = read(fd, buf, sizeof(buf));
-        if (n < 0) {
-            if (errno == EINTR) {
+        if (n < 0)
+        {
+            if (errno == EINTR)
+            {
                 continue;
             }
             close(fd);
             return -1;
         }
-        if (n == 0) {
+        if (n == 0)
+        {
             break;
         }
-        if (send_all(client_fd, buf, (size_t) n) != 0) {
+        if (send_all(client_fd, buf, (size_t)n) != 0)
+        {
             close(fd);
             return -1;
         }
@@ -878,7 +1051,8 @@ static int send_archive_file(int client_fd, const char *archive_path) {
 /* Function: Execute full filter, pack, send, and cleanup pipeline for query commands. */
 static int handle_archive_query(int client_fd,
                                 int (*matcher)(const char *, const struct stat *, void *),
-                                void *ctx) {
+                                void *ctx)
+{
     const char *root = get_search_root();
     int max_depth = get_max_scan_depth();
     file_list_t list = {0};
@@ -886,16 +1060,19 @@ static int handle_archive_query(int client_fd,
     int rc;
 
     rc = collect_matching_files_recursive(root, matcher, ctx, &list, 0, max_depth);
-    if (rc != 0) {
+    if (rc != 0)
+    {
         free_file_list(&list);
         return send_all(client_fd, "No file found\n", 14);
     }
-    if (list.count == 0) {
+    if (list.count == 0)
+    {
         free_file_list(&list);
         return send_all(client_fd, "No file found\n", 14);
     }
 
-    if (create_temp_archive(&list, archive_path, sizeof(archive_path)) != 0) {
+    if (create_temp_archive(&list, archive_path, sizeof(archive_path)) != 0)
+    {
         free_file_list(&list);
         return send_all(client_fd, "No file found\n", 14);
     }
@@ -905,29 +1082,33 @@ static int handle_archive_query(int client_fd,
     unlink(archive_path);
     free_file_list(&list);
 
-    if (rc != 0) {
+    if (rc != 0)
+    {
         return -1;
     }
     return 0;
 }
 
 /* Function: Handle fz command by configuring size_filter and running query pipeline. */
-static int handle_fz(int client_fd, const char *cmd) {
+static int handle_fz(int client_fd, const char *cmd)
+{
     long min_size;
     long max_size;
     size_filter_t f;
     // Parse the command into min_size and max_size
-    if (sscanf(cmd, "fz %ld %ld", &min_size, &max_size) != 2 || min_size < 0 || max_size < min_size) {
+    if (sscanf(cmd, "fz %ld %ld", &min_size, &max_size) != 2 || min_size < 0 || max_size < min_size)
+    {
         return send_all(client_fd, "No file found\n", 14);
     }
 
-    f.min_size = (off_t) min_size;
-    f.max_size = (off_t) max_size;
+    f.min_size = (off_t)min_size;
+    f.max_size = (off_t)max_size;
     return handle_archive_query(client_fd, match_size_filter, &f);
 }
 
 /* Function: Handle ft command by configuring ext_filter and running query pipeline. */
-static int handle_ft(int client_fd, const char *cmd) {
+static int handle_ft(int client_fd, const char *cmd)
+{
     char e1[32];
     char e2[32];
     char e3[32];
@@ -939,18 +1120,21 @@ static int handle_ft(int client_fd, const char *cmd) {
     e3[0] = '\0';
     // Parse the command into e1, e2, e3
     parts = sscanf(cmd, "ft %31s %31s %31s", e1, e2, e3);
-    if (parts < 1) {
+    if (parts < 1)
+    {
         return send_all(client_fd, "No file found\n", 14);
     }
     // Initialize the ext_filter
     memset(&f, 0, sizeof(f));
     f.exts[0] = e1;
     f.count = 1;
-    if (parts >= 2) {
+    if (parts >= 2)
+    {
         f.exts[1] = e2;
         f.count = 2;
     }
-    if (parts >= 3) {
+    if (parts >= 3)
+    {
         f.exts[2] = e3;
         f.count = 3;
     }
@@ -959,10 +1143,12 @@ static int handle_ft(int client_fd, const char *cmd) {
 }
 
 /* Function: Handle date filtering commands (fdb/fda) via query pipeline. */
-static int handle_fdx(int client_fd, const char *date_str, int before) {
+static int handle_fdx(int client_fd, const char *date_str, int before)
+{
     date_filter_t f;
     // Parse the date string into the threshold
-    if (parse_date_ymd(date_str, &f.threshold) != 0) {
+    if (parse_date_ymd(date_str, &f.threshold) != 0)
+    {
         return send_all(client_fd, "No file found\n", 14);
     }
     f.before = before;
@@ -974,23 +1160,27 @@ static int handle_fdx(int client_fd, const char *date_str, int before) {
  * Principle: Follows standard socket/bind/listen sequence with strict resource cleanup on error.
  * Immediately closes allocated resources on failure to avoid fd leaks.
  */
-static int create_listen_socket(const server_config_t *cfg) {
+static int create_listen_socket(const server_config_t *cfg)
+{
     int sock_fd;
     int opt = 1;
     struct sockaddr_in addr;
 
-    if (cfg == NULL) {
+    if (cfg == NULL)
+    {
         return -1;
     }
 
     /* 1) Create TCP socket */
     sock_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_fd < 0) {
+    if (sock_fd < 0)
+    {
         return -1;
     }
 
     /* 2) Allow fast port reuse to facilitate easy service reloads */
-    if (setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+    if (setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)
+    {
         close(sock_fd);
         return -1;
     }
@@ -1000,23 +1190,29 @@ static int create_listen_socket(const server_config_t *cfg) {
     addr.sin_port = htons((unsigned short)cfg->bind_port);
 
     // If the bind_host is not 0.0.0.0, then use the bind_host
-    if (cfg->bind_host != NULL && strcmp(cfg->bind_host, "0.0.0.0") != 0) {
-        if (inet_pton(AF_INET, cfg->bind_host, &addr.sin_addr) != 1) {
+    if (cfg->bind_host != NULL && strcmp(cfg->bind_host, "0.0.0.0") != 0)
+    {
+        if (inet_pton(AF_INET, cfg->bind_host, &addr.sin_addr) != 1)
+        {
             close(sock_fd);
             return -1;
         }
-    } else {
+    }
+    else
+    {
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
     }
 
     /* 3) Bind the address and port */
-    if (bind(sock_fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+    if (bind(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    {
         close(sock_fd);
         return -1;
     }
 
     /* 4) Start listening for incoming connections */
-    if (listen(sock_fd, BACKLOG) < 0) {
+    if (listen(sock_fd, BACKLOG) < 0)
+    {
         close(sock_fd);
         return -1;
     }
@@ -1029,36 +1225,45 @@ static int create_listen_socket(const server_config_t *cfg) {
  * Principle: Reads character-by-character until newline, filtering out CR. Returns 0 on close.
  * Returns 1 on success, -1 on error, for precise session cycle handling.
  */
-static int read_command_line(int client_fd, char *buf, size_t size) {
+static int read_command_line(int client_fd, char *buf, size_t size)
+{
     /* Read by line, with newline defining request boundary */
     size_t idx = 0;
 
-    if (buf == NULL || size == 0) {
+    if (buf == NULL || size == 0)
+    {
         return -1;
     }
 
-    while (idx + 1 < size) {
+    while (idx + 1 < size)
+    {
         char ch;
         ssize_t n = recv(client_fd, &ch, 1, 0);
 
-        if (n < 0) {
-            if (errno == EINTR) {
+        if (n < 0)
+        {
+            if (errno == EINTR)
+            {
                 continue;
             }
             return -1;
         }
-        if (n == 0) {
-            if (idx == 0) {
+        if (n == 0)
+        {
+            if (idx == 0)
+            {
                 return 0;
             }
             break;
         }
 
-        if (ch == '\n') {
+        if (ch == '\n')
+        {
             break;
         }
 
-        if (ch != '\r') {
+        if (ch != '\r')
+        {
             buf[idx++] = ch;
         }
     }
@@ -1077,17 +1282,21 @@ static int read_command_line(int client_fd, char *buf, size_t size) {
  * i.e. 7,10,13... go to primary; 8,11,14... go to mirror1; 9,12,15... go to mirror2.
  * Returns: 0=w26server, 1=mirror1, 2=mirror2
  */
-static int preferred_index_by_seq(long seq) {
-    if (seq <= 2) {
+static int preferred_index_by_seq(long seq)
+{
+    if (seq <= 2)
+    {
         return 0;
     }
-    if (seq <= 4) {
+    if (seq <= 4)
+    {
         return 1;
     }
-    if (seq <= 6) {
+    if (seq <= 6)
+    {
         return 2;
     }
-    return (int) ((seq - 7) % 3);
+    return (int)((seq - 7) % 3);
 }
 
 /*
@@ -1103,7 +1312,8 @@ static int preferred_index_by_seq(long seq) {
  *   Returns the pre-increment value for preferred_index_by_seq() routing.
  *   The file is unlinked on w26server startup, resetting sequence on reboot.
  */
-static long next_client_seq(void) {
+static long next_client_seq(void)
+{
     int fd;
     struct flock fl;
     char buf[32];
@@ -1111,7 +1321,8 @@ static long next_client_seq(void) {
     ssize_t n;
 
     fd = open(CLIENT_SEQ_FILE, O_RDWR | O_CREAT, 0644);
-    if (fd < 0) {
+    if (fd < 0)
+    {
         return 1;
     }
 
@@ -1122,50 +1333,59 @@ static long next_client_seq(void) {
     fl.l_len = 0;
 
     /* Acquire write lock, block until other processes release */
-    if (fcntl(fd, F_SETLKW, &fl) < 0) {
+    if (fcntl(fd, F_SETLKW, &fl) < 0)
+    {
         close(fd);
         return seq;
     }
 
     /* Read current sequence number */
     n = read(fd, buf, sizeof(buf) - 1);
-    if (n > 0) {
+    if (n > 0)
+    {
         buf[n] = '\0';
         seq = strtol(buf, NULL, 10);
-        if (seq < 1) {
+        if (seq < 1)
+        {
             seq = 1;
         }
     }
 
     /* Write back seq+1 for the next client */
-    if (lseek(fd, 0, SEEK_SET) == 0 && ftruncate(fd, 0) == 0) {
+    if (lseek(fd, 0, SEEK_SET) == 0 && ftruncate(fd, 0) == 0)
+    {
         snprintf(buf, sizeof(buf), "%ld\n", seq + 1);
-        (void) write(fd, buf, strlen(buf));
+        (void)write(fd, buf, strlen(buf));
     }
 
     /* Unlock and close */
     fl.l_type = F_UNLCK;
-    (void) fcntl(fd, F_SETLK, &fl);
+    (void)fcntl(fd, F_SETLK, &fl);
     close(fd);
 
     return seq;
 }
 
 /* Function: Determine if the command requires routing to workers. */
-static int is_business_command(const char *cmd) {
+static int is_business_command(const char *cmd)
+{
     char date_buf[32];
 
-    if (cmd == NULL) {
+    if (cmd == NULL)
+    {
         return 0;
     }
 
-    if (strcmp(cmd, "dirlist -a") == 0 || strcmp(cmd, "dirlist -t") == 0) {
+    if (strcmp(cmd, "dirlist -a") == 0 || strcmp(cmd, "dirlist -t") == 0)
+    {
         return 1;
     }
-    if (strncmp(cmd, "fn ", 3) == 0 || strncmp(cmd, "fz ", 3) == 0 || strncmp(cmd, "ft ", 3) == 0) {
+    if (strncmp(cmd, "fn ", 3) == 0 || strncmp(cmd, "fz ", 3) == 0 || strncmp(cmd, "ft ", 3) == 0)
+    {
         return 1;
     }
-    if (sscanf(cmd, "fdb %31s", date_buf) == 1 || sscanf(cmd, "fda %31s", date_buf) == 1) {
+    if (sscanf(cmd, "fdb %31s", date_buf) == 1 || sscanf(cmd, "fda %31s", date_buf) == 1)
+    {
         return 1;
     }
 
@@ -1173,32 +1393,41 @@ static int is_business_command(const char *cmd) {
 }
 
 /* Function: Execute business commands locally on the primary server, reusing logic. */
-static int process_local_business(int client_fd, const char *cmd) {
+static int process_local_business(int client_fd, const char *cmd)
+{
     char date_buf[32];
-    
-    if (strcmp(cmd, "dirlist -a") == 0) {
+
+    if (strcmp(cmd, "dirlist -a") == 0)
+    {
         return handle_dirlist_a(client_fd);
     }
-    if (strcmp(cmd, "dirlist -t") == 0) {
+    if (strcmp(cmd, "dirlist -t") == 0)
+    {
         return handle_dirlist_t(client_fd);
     }
-    if (strncmp(cmd, "fn ", 3) == 0) {
+    if (strncmp(cmd, "fn ", 3) == 0)
+    {
         const char *filename = cmd + 3;
-        while (*filename == ' ') {
+        while (*filename == ' ')
+        {
             filename++;
         }
         return handle_fn(client_fd, filename);
     }
-    if (strncmp(cmd, "fz ", 3) == 0) {
+    if (strncmp(cmd, "fz ", 3) == 0)
+    {
         return handle_fz(client_fd, cmd);
     }
-    if (strncmp(cmd, "ft ", 3) == 0) {
+    if (strncmp(cmd, "ft ", 3) == 0)
+    {
         return handle_ft(client_fd, cmd);
     }
-    if (sscanf(cmd, "fdb %31s", date_buf) == 1) {
+    if (sscanf(cmd, "fdb %31s", date_buf) == 1)
+    {
         return handle_fdx(client_fd, date_buf, 1);
     }
-    if (sscanf(cmd, "fda %31s", date_buf) == 1) {
+    if (sscanf(cmd, "fda %31s", date_buf) == 1)
+    {
         return handle_fdx(client_fd, date_buf, 0);
     }
 
@@ -1210,33 +1439,36 @@ static int process_local_business(int client_fd, const char *cmd) {
  * Principle: Connection node is assigned at accept and persists; local requests execute directly, mirror requests return REDIRECT.
  * Local handles directly; redirects trigger connection tear down and reconnect via client.
  */
-static int dispatch_business_command(int client_fd, const char *cmd, int route_index) {
+static int dispatch_business_command(int client_fd, const char *cmd, int route_index)
+{
     route_node_t nodes[3] = {
-        {"w26server", "127.0.0.1", DEFAULT_PORT, 1},
-        {"mirror1", MIRROR1_HOST, MIRROR1_PORT, 0},
-        {"mirror2", MIRROR2_HOST, MIRROR2_PORT, 0}
-    };
-    time_t mirror1_ts = (time_t) 0;
-    time_t mirror2_ts = (time_t) 0;
+        {"w26server", "127.0.0.1", g_primary_port, 1},
+        {"mirror1", MIRROR1_HOST, g_mirror1_port, 0},
+        {"mirror2", MIRROR2_HOST, g_mirror2_port, 0}};
+    time_t mirror1_ts = (time_t)0;
+    time_t mirror2_ts = (time_t)0;
     time_t now = time(NULL);
 
     /* Non-business commands return -2 indicating to handle differently */
-    if (!is_business_command(cmd)) {
+    if (!is_business_command(cmd))
+    {
         return -2;
     }
 
     /* Use heartbeat TTL to verify if the mirror node is currently considered online */
-    (void) load_heartbeat_status(&mirror1_ts, &mirror2_ts);
+    (void)load_heartbeat_status(&mirror1_ts, &mirror2_ts);
     nodes[1].online = (mirror1_ts > 0 && (now - mirror1_ts) <= HEARTBEAT_TTL_SEC) ? 1 : 0;
     nodes[2].online = (mirror2_ts > 0 && (now - mirror2_ts) <= HEARTBEAT_TTL_SEC) ? 1 : 0;
 
     /* route_index==0: Handles locally on the primary server */
-    if (route_index == 0) {
+    if (route_index == 0)
+    {
         return process_local_business(client_fd, cmd);
     }
 
     /* Errors if target mirror is offline (secondary protection) */
-    if (!nodes[route_index].online) {
+    if (!nodes[route_index].online)
+    {
         return send_all(client_fd, "Target mirror offline\n", 22);
     }
 
@@ -1247,7 +1479,8 @@ static int dispatch_business_command(int client_fd, const char *cmd, int route_i
                  sizeof(line_buf),
                  "REDIRECT %s %d\n",
                  nodes[route_index].host,
-                 nodes[route_index].port) < 0) {
+                 nodes[route_index].port) < 0)
+    {
         return -1;
     }
 
@@ -1258,12 +1491,14 @@ static int dispatch_business_command(int client_fd, const char *cmd, int route_i
  * Function: Process a single client command and return response.
  * Ensures no arbitrary mid-connection routing changes.
  */
-static int process_command(int client_fd, const char *cmd, int route_index) {
+static int process_command(int client_fd, const char *cmd, int route_index)
+{
     char resp[MAX_COMMAND_LEN + 64];
     char nodes_line[128];
     int route_rc;
 
-    if (cmd == NULL) {
+    if (cmd == NULL)
+    {
         return -1;
     }
 
@@ -1275,26 +1510,29 @@ static int process_command(int client_fd, const char *cmd, int route_index) {
      *   3) If target online -> return REDIRECT, client reconnects
      * This ensures the client routes to an available node.
      */
-    if (strcmp(cmd, "CONNECT_PROBE") == 0) {
+    if (strcmp(cmd, "CONNECT_PROBE") == 0)
+    {
         route_node_t nodes[3] = {
-            {"w26server", "127.0.0.1", DEFAULT_PORT, 1},
-            {"mirror1", MIRROR1_HOST, MIRROR1_PORT, 0},
-            {"mirror2", MIRROR2_HOST, MIRROR2_PORT, 0}
-        };
-        time_t m1_ts = (time_t) 0;
-        time_t m2_ts = (time_t) 0;
+            {"w26server", "127.0.0.1", g_primary_port, 1},
+            {"mirror1", MIRROR1_HOST, g_mirror1_port, 0},
+            {"mirror2", MIRROR2_HOST, g_mirror2_port, 0}};
+        time_t m1_ts = (time_t)0;
+        time_t m2_ts = (time_t)0;
         time_t now = time(NULL);
         char line_buf[128];
 
-        (void) load_heartbeat_status(&m1_ts, &m2_ts);
+        (void)load_heartbeat_status(&m1_ts, &m2_ts);
         nodes[1].online = (m1_ts > 0 && (now - m1_ts) <= HEARTBEAT_TTL_SEC) ? 1 : 0;
         nodes[2].online = (m2_ts > 0 && (now - m2_ts) <= HEARTBEAT_TTL_SEC) ? 1 : 0;
 
-        if (route_index == 0 || !nodes[route_index].online) {
+        if (route_index == 0 || !nodes[route_index].online)
+        {
             snprintf(line_buf, sizeof(line_buf),
                      "CONNECTED %s %s %d\n",
                      nodes[0].name, nodes[0].host, nodes[0].port);
-        } else {
+        }
+        else
+        {
             snprintf(line_buf, sizeof(line_buf),
                      "REDIRECT %s %d\n",
                      nodes[route_index].host, nodes[route_index].port);
@@ -1302,20 +1540,24 @@ static int process_command(int client_fd, const char *cmd, int route_index) {
         return send_all(client_fd, line_buf, strlen(line_buf));
     }
 
-    if (strcmp(cmd, "GET_NODES") == 0) {
-        if (build_nodes_status_line(nodes_line, sizeof(nodes_line)) != 0) {
+    if (strcmp(cmd, "GET_NODES") == 0)
+    {
+        if (build_nodes_status_line(nodes_line, sizeof(nodes_line)) != 0)
+        {
             return send_all(client_fd, "NODES w26server=1 mirror1=0 mirror2=0\n", 38);
         }
         return send_all(client_fd, nodes_line, strlen(nodes_line));
     }
 
     route_rc = dispatch_business_command(client_fd, cmd, route_index);
-    if (route_rc != -2) {
+    if (route_rc != -2)
+    {
         return route_rc;
     }
 
     /* Unrecognized commands reply with ACK formatting. */
-    if (snprintf(resp, sizeof(resp), "ACK from %s: %s\n", NODE_NAME, cmd) < 0) {
+    if (snprintf(resp, sizeof(resp), "ACK from %s: %s\n", NODE_NAME, cmd) < 0)
+    {
         return -1;
     }
 
@@ -1341,13 +1583,16 @@ static int process_command(int client_fd, const char *cmd, int route_index) {
  *   - quitc command triggered
  *   - Exception
  */
-static void crequest(int client_fd) {
+static void crequest(int client_fd)
+{
     char cmd[MAX_COMMAND_LEN];
     int route_index = -1;
 
-    for (;;) {
+    for (;;)
+    {
         int rc = read_command_line(client_fd, cmd, sizeof(cmd));
-        if (rc <= 0) {
+        if (rc <= 0)
+        {
             break;
         }
 
@@ -1356,12 +1601,16 @@ static void crequest(int client_fd) {
          * Short-lived internal protocol; terminates connection block directly on completion.
          * Avoids moving sequence increment blocks and breaking client routing formulas.
          */
-        if (strncmp(cmd, "HEARTBEAT ", 10) == 0) {
+        if (strncmp(cmd, "HEARTBEAT ", 10) == 0)
+        {
             const char *node_name = cmd + 10;
-            if (update_heartbeat(node_name) == 0) {
-                (void) send_all(client_fd, "HB_OK\n", 6);
-            } else {
-                (void) send_all(client_fd, "HB_ERR\n", 7);
+            if (update_heartbeat(node_name) == 0)
+            {
+                (void)send_all(client_fd, "HB_OK\n", 6);
+            }
+            else
+            {
+                (void)send_all(client_fd, "HB_ERR\n", 7);
             }
             break;
         }
@@ -1371,7 +1620,8 @@ static void crequest(int client_fd) {
          * Uses file locking for cross-process atomic reads.
          * Resolves sequence into routing cluster indexing.
          */
-        if (route_index < 0) {
+        if (route_index < 0)
+        {
             long seq = next_client_seq();
             route_index = preferred_index_by_seq(seq);
             printf("%s client #%ld routed to %s\n",
@@ -1381,12 +1631,14 @@ static void crequest(int client_fd) {
             fflush(stdout);
         }
 
-        if (strcmp(cmd, "quitc") == 0) {
-            (void) send_all(client_fd, "BYE\n", 4);
+        if (strcmp(cmd, "quitc") == 0)
+        {
+            (void)send_all(client_fd, "BYE\n", 4);
             break;
         }
 
-        if (process_command(client_fd, cmd, route_index) != 0) {
+        if (process_command(client_fd, cmd, route_index) != 0)
+        {
             break;
         }
     }
@@ -1397,10 +1649,12 @@ static void crequest(int client_fd) {
  * Principle: Standard parent-accepts-and-forks server pattern using SIGCHLD ignoration.
  * Returns rapidly to accepting on parent via process concurrency, bypassing zombie threads.
  */
-static int run_server(const server_config_t *cfg) {
+static int run_server(const server_config_t *cfg)
+{
     int listen_fd = create_listen_socket(cfg);
     // If the listen_fd is less than 0, then return 1
-    if (listen_fd < 0) {
+    if (listen_fd < 0)
+    {
         fprintf(stderr, "%s: failed to create listen socket\n", NODE_NAME);
         return 1;
     }
@@ -1408,14 +1662,17 @@ static int run_server(const server_config_t *cfg) {
     /* Auto reap child process exit to avoid zombies */
     signal(SIGCHLD, SIG_IGN);
 
-    for (;;) {
+    for (;;)
+    {
         // Accept a new client connection
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(listen_fd, (struct sockaddr *) &client_addr, &client_len);
+        int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
 
-        if (client_fd < 0) {
-            if (errno == EINTR) {
+        if (client_fd < 0)
+        {
+            if (errno == EINTR)
+            {
                 continue;
             }
             perror("accept");
@@ -1424,13 +1681,15 @@ static int run_server(const server_config_t *cfg) {
 
         pid_t pid = fork();
         // If the pid is less than 0, then close the client_fd and continue
-        if (pid < 0) {
+        if (pid < 0)
+        {
             perror("fork");
             close(client_fd);
             continue;
         }
         // If the pid is 0, then close the listen_fd and call crequest to handle the client connection
-        if (pid == 0) {
+        if (pid == 0)
+        {
             close(listen_fd);
             crequest(client_fd);
             close(client_fd);
@@ -1450,17 +1709,19 @@ static int run_server(const server_config_t *cfg) {
  * Principle: Instantiates baseline parameters and proceeds into listen loop safely.
  * Runs base init sequences before turning logic block to daemon server pool.
  */
-int main(void) {
+int main(void)
+{
     server_config_t cfg;
+    load_runtime_ports();
     /* Listen on all interfaces */
     cfg.bind_host = "0.0.0.0";
-    cfg.bind_port = DEFAULT_PORT;
+    cfg.bind_port = g_primary_port;
 
     /* Seed state file to avoid initial GET_NODES errors */
-    (void) save_heartbeat_status((time_t) 0, (time_t) 0);
+    (void)save_heartbeat_status((time_t)0, (time_t)0);
 
     /* Reset connection sequence loop counter file */
-    (void) unlink(CLIENT_SEQ_FILE);
+    (void)unlink(CLIENT_SEQ_FILE);
 
     printf("%s starting on port %d\n", NODE_NAME, cfg.bind_port);
     return run_server(&cfg);

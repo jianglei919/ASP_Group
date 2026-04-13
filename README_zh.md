@@ -188,6 +188,165 @@ sequenceDiagram
     Note over W: GET_NODES 查询时<br/>心跳时间差 <= 6s → 在线<br/>心跳时间差 > 6s → 离线
 ```
 
+### 4.4 client - server 完整时序图
+```mermaid
+%%{init: {
+    "theme": "base",
+    "themeVariables": {
+        "primaryColor": "#fff",
+        "lineColor": "#666",
+        "tertiaryColor": "#fff"
+    },
+    "themeCSS": "
+        .messageLine0,.messageLine1,.messageLine2,.messageLine3,.messageLine4,.messageLine5,.messageLine6,.messageLine7{stroke:#1565c0!important;}
+        .messageLine8,.messageLine9,.messageLine10,.messageLine11,.messageLine12,.messageLine13,.messageLine14,.messageLine15{stroke:#2e7d32!important;}
+        .messageLine16,.messageLine17,.messageLine18,.messageLine19,.messageLine20,.messageLine21,.messageLine22,.messageLine23{stroke:#6a1b9a!important;}
+        .messageLine24,.messageLine25,.messageLine26,.messageLine27,.messageLine28,.messageLine29,.messageLine30,.messageLine31{stroke:#ef6c00!important;}
+        .messageLine32,.messageLine33,.messageLine34,.messageLine35,.messageLine36,.messageLine37,.messageLine38,.messageLine39{stroke:#00838f!important;}
+        .messageLine40,.messageLine41,.messageLine42,.messageLine43,.messageLine44,.messageLine45,.messageLine46,.messageLine47{stroke:#c62828!important;}
+    "
+}}%%
+sequenceDiagram
+    autonumber
+
+    box rgb(208, 235, 255) 客户端侧
+        participant C as Client
+    end
+
+        box rgb(255, 224, 178) 主服务端侧
+        participant W as w26server:5000
+                participant SF as /tmp/w26_client_seq.txt
+                participant ST as /tmp/w26_nodes_status.txt
+    end
+
+    box rgb(200, 230, 201) 镜像服务端侧
+        participant M1 as mirror1:5001
+        participant M2 as mirror2:5002
+    end
+
+    %% ===== 建立连接与路由探测 =====
+    rect rgb(232, 245, 253)
+        Note over C,W: 阶段A：客户端接入与 CONNECT_PROBE
+        C->>W: TCP connect(:5000)
+        C->>W: CONNECT_PROBE
+    end
+
+    rect rgb(255, 243, 224)
+        Note over W,SF: 阶段B：客户端序号分配（w26_client_seq.txt）
+        W->>SF: open + fcntl(F_SETLKW) 加写锁
+        W->>SF: read current seq
+        W->>SF: write seq+1
+        W->>SF: unlock + close
+        W->>W: preferred_index_by_seq(seq)
+    end
+
+    rect rgb(232, 245, 233)
+        Note over W,ST: 阶段C：节点在线状态判断（w26_nodes_status.txt）
+        W->>ST: load_heartbeat_status()
+        ST-->>W: mirror1_ts, mirror2_ts
+        W->>W: 基于 HEARTBEAT_TTL_SEC 计算 online/offline
+    end
+
+    alt 路由到 w26server 或目标 mirror 离线
+        rect rgb(255, 248, 225)
+            W-->>C: CONNECTED w26server 127.0.0.1 5000
+            Note over C,W: 客户端留在 w26server 会话
+        end
+    else 路由到 mirror1 且在线
+        rect rgb(232, 245, 233)
+            W-->>C: REDIRECT 127.0.0.1 5001
+            C->>W: close current socket
+            C->>M1: TCP connect(:5001)
+            C->>M1: CONNECT_PROBE
+            M1-->>C: CONNECTED mirror1 127.0.0.1 5001
+            Note over C,M1: 客户端切换到 mirror1 会话
+        end
+    else 路由到 mirror2 且在线
+        rect rgb(243, 229, 245)
+            W-->>C: REDIRECT 127.0.0.1 5002
+            C->>W: close current socket
+            C->>M2: TCP connect(:5002)
+            C->>M2: CONNECT_PROBE
+            M2-->>C: CONNECTED mirror2 127.0.0.1 5002
+            Note over C,M2: 客户端切换到 mirror2 会话
+        end
+    end
+
+    %% ===== 业务命令阶段（按已建立会话处理） =====
+    alt 会话留在 w26server
+        rect rgb(227, 242, 253)
+            loop 业务命令循环（直到 quitc）
+                C->>W: dirlist -a / dirlist -t / fn filename
+                W->>W: 本地处理并返回文本结果
+                W-->>C: response
+            end
+        end
+    else 会话已重连 mirror1
+        rect rgb(232, 245, 233)
+            loop 业务命令循环（直到 quitc）
+                C->>M1: dirlist -a / dirlist -t / fn filename
+                M1->>M1: 本地处理并返回文本结果
+                M1-->>C: response
+            end
+        end
+    else 会话已重连 mirror2
+        rect rgb(243, 229, 245)
+            loop 业务命令循环（直到 quitc）
+                C->>M2: dirlist -a / dirlist -t / fn filename
+                M2->>M2: 本地处理并返回文本结果
+                M2-->>C: response
+            end
+        end
+    end
+
+    %% ===== 镜像心跳写入状态文件（与客户端会话并行发生） =====
+    rect rgb(232, 245, 233)
+        loop 每 2 秒（后台）
+            M1->>W: HEARTBEAT mirror1
+            W->>ST: update mirror1 timestamp
+            W-->>M1: HB_OK
+            M2->>W: HEARTBEAT mirror2
+            W->>ST: update mirror2 timestamp
+            W-->>M2: HB_OK
+        end
+    end
+
+    %% ===== 控制命令（由 w26server 提供） =====
+    rect rgb(255, 249, 196)
+        C->>W: GET_NODES
+        W->>ST: build_nodes_status_line()
+        alt build success
+            W-->>C: NODES w26server=1 mirror1=N mirror2=N
+        else build failed (兜底)
+            W-->>C: NODES w26server=1 mirror1=0 mirror2=0
+        end
+    end
+
+    %% ===== 退出流程（按当前会话节点） =====
+    alt 当前会话在 w26server
+        rect rgb(255, 235, 238)
+            C->>W: quitc
+            W-->>C: BYE
+            C->>W: close socket
+            Note over C,W: 会话正常结束
+        end
+    else 当前会话在 mirror1
+        rect rgb(255, 235, 238)
+            C->>M1: quitc
+            M1-->>C: BYE
+            C->>M1: close socket
+            Note over C,M1: 会话正常结束
+        end
+    else 当前会话在 mirror2
+        rect rgb(255, 235, 238)
+            C->>M2: quitc
+            M2-->>C: BYE
+            C->>M2: close socket
+            Note over C,M2: 会话正常结束
+        end
+    end
+```
+
 ## 5. 通信协议
 
 ```mermaid
@@ -333,6 +492,26 @@ make clean && make
 client connected to w26server (127.0.0.1:5001), NODE: mirror1
 ```
 
+### 端口配置（默认与自定义）
+
+服务端/客户端脚本现在会从 `scripts/ports.env.sh` 读取共享端口配置。
+
+默认端口（不设置环境变量）：
+
+```bash
+./scripts/start_all_servers.sh --depth 6
+./scripts/run_client.sh
+```
+
+自定义端口（按用户/会话设置）：
+
+```bash
+W26_PRIMARY_PORT=15000 W26_MIRROR1_PORT=15001 W26_MIRROR2_PORT=15002 ./scripts/start_all_servers.sh --depth 6
+W26_PRIMARY_PORT=15000 W26_MIRROR1_PORT=15001 W26_MIRROR2_PORT=15002 ./scripts/run_client.sh
+```
+
+注意：在 `VAR=... cmd1 | cmd2` 里，临时变量只作用于 `cmd1`，不会自动传给 `cmd2`。如果两边都要用，请先 `export`（或分别在每个命令前设置）。
+
 ### 查看状态 / 停止
 
 ```bash
@@ -359,10 +538,13 @@ client connected to w26server (127.0.0.1:5001), NODE: mirror1
 
 ## 11. 环境变量
 
-| 变量                 | 默认值  | 说明                     |
-| -------------------- | ------- | ------------------------ |
-| `W26_SEARCH_ROOT`    | `$HOME` | 文件搜索根目录           |
-| `W26_MAX_SCAN_DEPTH` | `8`     | 递归扫描最大深度（1-64） |
+| 变量                 | 默认值  | 说明                           |
+| -------------------- | ------- | ------------------------------ |
+| `W26_SEARCH_ROOT`    | `$HOME` | 文件搜索根目录                 |
+| `W26_MAX_SCAN_DEPTH` | `8`     | 递归扫描最大深度（1-64）       |
+| `W26_PRIMARY_PORT`   | `5000`  | 主服务端监听/连接端口          |
+| `W26_MIRROR1_PORT`   | `5001`  | mirror1 监听/连接端口          |
+| `W26_MIRROR2_PORT`   | `5002`  | mirror2 监听/连接端口          |
 
 在大目录下执行文件检索时，建议限制搜索范围以避免耗时过长：
 

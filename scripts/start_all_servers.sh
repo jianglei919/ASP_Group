@@ -8,6 +8,8 @@ PID_DIR="$ROOT_DIR/.pids"
 SEARCH_ROOT=""
 MAX_DEPTH=""
 
+source "$SCRIPT_DIR/ports.env.sh"
+
 usage() {
     cat << 'EOF'
 Usage: scripts/start_all_servers.sh [--root <path>] [--depth <1-64>]
@@ -74,8 +76,8 @@ fi
 _has_live=false
 for _pidfile in "$PID_DIR"/*.pid; do
     [[ -f "$_pidfile" ]] || continue
-    _pid=$(<"$_pidfile")
-    if kill -0 "$_pid" 2>/dev/null; then
+    _pid=$(< "$_pidfile")
+    if kill -0 "$_pid" 2> /dev/null; then
         _has_live=true
         echo "Error: $(basename "$_pidfile" .pid) (pid $_pid) is still running."
     else
@@ -87,19 +89,26 @@ if $_has_live; then
     exit 1
 fi
 
-nohup env W26_SEARCH_ROOT="$SEARCH_ROOT" W26_MAX_SCAN_DEPTH="$MAX_DEPTH" ./out/w26server > "$LOG_DIR/w26server.log" 2>&1 &
+nohup env W26_SEARCH_ROOT="$SEARCH_ROOT" W26_MAX_SCAN_DEPTH="$MAX_DEPTH" \
+    W26_PRIMARY_PORT="$W26_PRIMARY_PORT" W26_MIRROR1_PORT="$W26_MIRROR1_PORT" W26_MIRROR2_PORT="$W26_MIRROR2_PORT" \
+    ./out/w26server > "$LOG_DIR/w26server.log" 2>&1 &
 echo $! > "$PID_DIR/w26server.pid"
 
-nohup env W26_SEARCH_ROOT="$SEARCH_ROOT" W26_MAX_SCAN_DEPTH="$MAX_DEPTH" ./out/mirror1 > "$LOG_DIR/mirror1.log" 2>&1 &
+nohup env W26_SEARCH_ROOT="$SEARCH_ROOT" W26_MAX_SCAN_DEPTH="$MAX_DEPTH" \
+    W26_PRIMARY_PORT="$W26_PRIMARY_PORT" W26_MIRROR1_PORT="$W26_MIRROR1_PORT" W26_MIRROR2_PORT="$W26_MIRROR2_PORT" \
+    ./out/mirror1 > "$LOG_DIR/mirror1.log" 2>&1 &
 echo $! > "$PID_DIR/mirror1.pid"
 
-nohup env W26_SEARCH_ROOT="$SEARCH_ROOT" W26_MAX_SCAN_DEPTH="$MAX_DEPTH" ./out/mirror2 > "$LOG_DIR/mirror2.log" 2>&1 &
+nohup env W26_SEARCH_ROOT="$SEARCH_ROOT" W26_MAX_SCAN_DEPTH="$MAX_DEPTH" \
+    W26_PRIMARY_PORT="$W26_PRIMARY_PORT" W26_MIRROR1_PORT="$W26_MIRROR1_PORT" W26_MIRROR2_PORT="$W26_MIRROR2_PORT" \
+    ./out/mirror2 > "$LOG_DIR/mirror2.log" 2>&1 &
 echo $! > "$PID_DIR/mirror2.pid"
 
 echo "Servers started."
 echo "w26server pid: $(cat "$PID_DIR/w26server.pid")"
 echo "mirror1   pid: $(cat "$PID_DIR/mirror1.pid")"
 echo "mirror2   pid: $(cat "$PID_DIR/mirror2.pid")"
+echo "Ports: primary=$W26_PRIMARY_PORT mirror1=$W26_MIRROR1_PORT mirror2=$W26_MIRROR2_PORT"
 echo "Logs: $LOG_DIR"
 if [[ -n "$SEARCH_ROOT" ]]; then
     echo "Search root: $SEARCH_ROOT"

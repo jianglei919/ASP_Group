@@ -6,6 +6,8 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SEARCH_ROOT=""
 MAX_DEPTH=""
 
+source "$SCRIPT_DIR/ports.env.sh"
+
 usage() {
     cat << 'EOF'
 Usage: scripts/run_w26server.sh [--root <path>] [--depth <1-64>]
@@ -60,4 +62,6 @@ if [[ -n "$MAX_DEPTH" ]]; then
 fi
 
 cd "$ROOT_DIR"
-exec env W26_SEARCH_ROOT="$SEARCH_ROOT" W26_MAX_SCAN_DEPTH="$MAX_DEPTH" ./out/w26server
+exec env W26_SEARCH_ROOT="$SEARCH_ROOT" W26_MAX_SCAN_DEPTH="$MAX_DEPTH" \
+    W26_PRIMARY_PORT="$W26_PRIMARY_PORT" W26_MIRROR1_PORT="$W26_MIRROR1_PORT" W26_MIRROR2_PORT="$W26_MIRROR2_PORT" \
+    ./out/w26server
